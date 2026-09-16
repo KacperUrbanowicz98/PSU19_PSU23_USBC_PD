@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+reports/
+backup/
+logs/
+raw/
+serial_attempts.json
+pending_results.json
+config_audit.log
+test_config.json.bak
+test_config.json.tmp
