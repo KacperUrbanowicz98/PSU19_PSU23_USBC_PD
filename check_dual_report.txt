@@ -1,0 +1,165 @@
+Konsola: C:\USBPDAPI\USBPDConsole.exe
+Skrypt wywołuje wyłącznie komendy odczytu: -h, -f, -c, -s. Nie ustawia profilu
+ani obciążenia, więc jest bezpieczny dla podłączonego zasilacza.
+
+============================================================================
+  1. Pełna pomoc konsoli
+============================================================================
+  Zapisano pełną pomoc do: C:\Users\kacper.urbanowicz\PycharmProjects\PSU19_PSU23_USBC_PD\console_help.txt  (kod 0, 319 ms)
+
+  PassMark Software USBPDConsole V1.0.1016
+  Usage: C:\USBPDAPI\USBPDConsole.exe [-f] [-d] [-i] [-c] [-p] [-s] [-r] [-v] [-l] [-q] [-n] [-m] [-o] [-u] [-w] [-k] [-b] [-x] [-y]
+  Options:
+  	-h,--help		Shows this help message
+  	-f,--find		Finds all the PD tester devices and their indexes.
+  	-d,--device		Specifies the PD tester by serial number. Device ID or "Any"
+  				If the ID, "Any" is used then the first device detected is selected.
+  				Default value if empty: The first detected device will be used.
+  	-i,--index		Specifies the PD tester by index.
+  	-c,--connection		Returns the connection status.
+  	-p,--profiles		Returns all the profiles supported by DUT.
+  	-s,--stats		Returns DUT status.
+  	-r,--config		Returns the configuration of the PD tester.
+  	-v,--setprofile		Sets a profile. Index starts from 1.
+  				For fixed profile use -v index. For variable voltage profile use: -v index,voltage (mV)
+  	-l,--load		Sets the current (mA).
+  	-q,--quickload		Sets the current (mA) quickly, optionally set the slope of the current.
+  				For default quick load: -q load (ma). For setting slope: -q load,slope (mA/ms).
+  	-m,--defload		Sets default load (mA) or "Max" for maximum available current.
+  	-n,--defvolt		Sets default voltage (mV).
+  	-o,--maxload		Sets maximum allowed current (mA). Set to 0 to enable enforce automatic limits.
+  	-u,--defprofile		Sets default profile by index. Set to 0 to enable auto selection.
+  				For variable voltage profile default voltage should also be set.
+  	-w,--oprcurrent		Sets the operating current in RDO or "Max" for max available current.
+  	-k,--sinkcap		Sets the capabiltity advertised by the sink. Use: -k voltage(mV),current(mA).
+  				Or for no additional capability, use: -k "None".
+  	-b,--usbconnection	Simulates a physical disconnection or connection of the DUT.
+  				For disconnection use: -b 0. For connection: -b 1.
+  	-e,--setPDsupport	Sets if the PDTester supports PD profiles.
+  				For no PD profiles: -e 0. For PD profiles supported: -e 1.
+  	-x,--setHoldLoad	Sets if the the load is held during voltage changes. Use -x 0 to disable, -x 1 to enable.
+  	-y,--stepresponse	Performs a step load test. Use: -y initial current,final current (mA)
+  
+  Return Codes:
+  	 Succeed = 0
+  	 Invalid command line = 1
+  	 No device detected = 2
+  	 Failed to connect = 3
+  	 Invalid profile = 4
+  	 Command is not supported by PD tester model = 5
+  	 Device firmare update required = 6
+  
+  Example:
+  	USBPDConsole.exe -d pmpd4vlh7y -v 3,6000
+
+============================================================================
+  2. Wykrywanie urządzeń (--find)
+============================================================================
+  C:\USBPDAPI\USBPDConsole.exe -f   -> kod 0, 859 ms
+
+      0=PMPD80LLAD
+      1=PMPD80LN6E
+
+  Wykryte urządzenia: [('0', 'PMPD80LLAD'), ('1', 'PMPD80LN6E')]
+
+============================================================================
+  3. Czy -d wybiera konkretne urządzenie
+============================================================================
+  -c zwraca status DUT (zasilacza), nie testera. Bez wpiętego zasilacza
+  poprawną odpowiedzią jest STATUS:NOT CONNECTED z kodem Succeed.
+
+  Sprawdzane: A = PMPD80LLAD, B = PMPD80LN6E
+
+  [OK  ] -d PMPD80LLAD       Succeed                        684 ms   STATUS:NOT CONNECTED
+  [OK  ] -d PMPD80LN6E       Succeed                        718 ms   STATUS:NOT CONNECTED
+  [BŁĄD] -d PMPD00000A       Failed to connect             1711 ms   Error: Device not found.
+
+  Zasilacz w gnieździe A: nie
+  Zasilacz w gnieździe B: nie
+
+  WNIOSEK: adresacja przez -d działa poprawnie.
+
+============================================================================
+  3a. Konfiguracja testerów (-r)
+============================================================================
+  Porównaj oba wydruki. Różnice w maxload / defload / defvolt / holdload
+  oznaczają, że testery nie są skonfigurowane jednakowo.
+
+  --- Tester A (PMPD80LLAD) — Succeed, 902 ms
+      LOOPBACK PORT: ENABLED
+      MAX SDP CURRENT: 500mA
+      ESTIMATE VBUS: DISABLED
+      CABLE RESISTANCE: 80 Ohms
+      DEFAULT VOLTAGE: 5000mV
+      DEFAULT LOAD: 0mA
+      DEFAULT PROFILE INDEX: AUTO
+      OPERATING CURRENT: MAX
+      SINK CAPABILITY: NONE
+      HOLD LOAD ON VOLTAGE CHANGES: DISABLED
+
+  --- Tester B (PMPD80LN6E) — Succeed, 1028 ms
+      LOOPBACK PORT: ENABLED
+      MAX SDP CURRENT: 500mA
+      ESTIMATE VBUS: DISABLED
+      CABLE RESISTANCE: 80 Ohms
+      DEFAULT VOLTAGE: 5000mV
+      DEFAULT LOAD: 0mA
+      DEFAULT PROFILE INDEX: AUTO
+      OPERATING CURRENT: MAX
+      SINK CAPABILITY: NONE
+      HOLD LOAD ON VOLTAGE CHANGES: DISABLED
+
+
+============================================================================
+  3b. Profile deklarowane przez DUT (-p)
+============================================================================
+  Z wpiętym zasilaczem ta komenda mówi, jakie profile wyrób faktycznie oferuje.
+
+  --- Gniazdo A (PMPD80LLAD) — Succeed, 615 ms
+      NUM PROFILES:0
+
+  --- Gniazdo B (PMPD80LN6E) — Succeed, 897 ms
+      NUM PROFILES:0
+
+
+============================================================================
+  4. Czas pojedynczej komendy
+============================================================================
+  Mierzone na -c (działa niezależnie od obecności zasilacza) oraz na -s.
+
+  -c: średnio    674 ms   (min 573, max 1276)
+  -s: średnio    596 ms   (min 540, max 640)
+
+  Urządzenie A: średnio    556 ms   (min 545, max 591)
+  Urządzenie B: średnio    609 ms   (min 589, max 673)
+
+============================================================================
+  4a. Czas odwołania do nieobecnego urządzenia
+============================================================================
+  Decyduje o tym, jak szybko aplikacja wykryje odpięty tester w trakcie testu.
+
+  -d PMPD00000A: średnio 1641 ms (min 1608, max 1680)
+  Zalecany command_timeout: co najmniej 5.0 s
+
+============================================================================
+  5. Równoległość dwóch instancji konsoli
+============================================================================
+  Czas oczekiwany przy pełnej serializacji: 11.7 s
+  Czas oczekiwany przy pełnej równoległości: 5.8 s
+  Trwa pomiar...
+
+  Zmierzony czas: 6.0 s   (współczynnik 0.52)
+  Błędy przy pracy równoległej: 0   (tło pojedyncze: 0)
+  Nadwyżka ponad tło = realne kolizje: 0
+
+============================================================================
+  WNIOSEK
+============================================================================
+  Dwie instancje konsoli działają RÓWNOLEGLE.
+  Możliwe jest pełne stanowisko dwukanałowe z ~dwukrotną przepustowością.
+
+  Czas jednej komendy:        583 ms
+  Adresacja:                  -d PMPD80LLAD / -d PMPD80LN6E
+  Próbek na fazę 2,5 s:       ~4 na stanowisko (bez zmian)
+  Zalecenie: osobny wątek i osobny klient PM125 na stanowisko, wspólny raport
+             z kolumną stanowiska i wspólny licznik prób.

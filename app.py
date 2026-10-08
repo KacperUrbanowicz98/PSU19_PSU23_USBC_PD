@@ -1,4 +1,4 @@
-"""Punkt startowy PSU19 Tester v4."""
+"""Punkt startowy PSU19 Tester v5 (jedno lub kilka stanowisk)."""
 from __future__ import annotations
 
 import argparse
@@ -8,10 +8,10 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox
 
-from config import AppConfig, ConfigError, app_directory
-from hardware import PM125Client, SimulatedPM125
+from config import AppConfig, ConfigError, app_directory, stations_from_devices
+from hardware import find_devices
 from logging_utils import configure_logging
-from ui import TesterApp
+from ui import TesterApp, build_hardware
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
         default="pass",
     )
     parser.add_argument("--debug", action="store_true", help="Log DEBUG (każda komenda PM125)")
+    parser.add_argument(
+        "--simulate-delay",
+        type=float,
+        default=0.0,
+        help="Opóźnienie jednej komendy w symulatorze [s] — odwzorowuje wolną konsolę PM125",
+    )
     return parser.parse_args()
 
 
@@ -72,16 +78,94 @@ def main() -> int:
         root.destroy()
         return 3
 
-    hardware = (
-        SimulatedPM125(args.simulate_mode)
-        if args.simulate
-        else PM125Client(config.console_path, config.device_serial, config.command_timeout)
+    stations = config.active_stations()
+    logger.info(
+        "Stanowiska: %s", ", ".join(f"{item.name}={item.address}" for item in stations)
     )
+    if not args.simulate:
+        detected = find_devices(config.console_path)
+        logger.info("Testery widoczne dla konsoli: %s", detected or "brak")
+        config = _offer_detected_stations(config, detected, config_path, root)
+        stations = config.active_stations()
+        _warn_about_missing_devices(stations, detected, root)
+
+    hardware = build_hardware(config, args.simulate, args.simulate_mode, args.simulate_delay)
 
     root.deiconify()
     TesterApp(root, config, hardware, config_path, simulation_mode=args.simulate)
     root.mainloop()
     return 0
+
+
+def _offer_detected_stations(
+    config: AppConfig, detected: list[tuple[int, str]], config_path: Path, root: tk.Tk
+) -> AppConfig:
+    """Proponuje konfigurację kanałów, gdy podłączono więcej testerów niż skonfigurowano.
+
+    Dzięki temu dołożenie drugiego testera wystarczy potwierdzić przy starcie — bez
+    wchodzenia do panelu inżynieryjnego i bez ponownego uruchamiania aplikacji.
+    """
+    stations = config.active_stations()
+    if len(detected) <= len(stations):
+        return config
+    configured = {
+        station.device_serial.upper() for station in stations if station.device_serial
+    }
+    proposal = stations_from_devices(detected)
+    listing = "\n".join(f"  • {item.name} — {item.device_serial}" for item in proposal)
+    answer = messagebox.askyesno(
+        "PSU19 Tester — wykryto testery",
+        f"Podłączonych testerów: {len(detected)}, a skonfigurowanych stanowisk: "
+        f"{len(stations)}.\n\nSkonfigurować wszystkie wykryte testery jako osobne "
+        f"stanowiska?\n\n{listing}\n\n"
+        "Nazwy i przypisanie można zmienić w panelu inżynieryjnym (zakładka Stanowiska).",
+        parent=root,
+    )
+    if not answer:
+        logger.info("Operator odrzucił propozycję konfiguracji wykrytych testerów.")
+        return config
+    config.stations = proposal
+    try:
+        config.save(
+            config_path,
+            audit_note=(
+                "automatyczna konfiguracja stanowisk z wykrytych testerów: "
+                + ", ".join(f"{item.name}={item.device_serial}" for item in proposal)
+            ),
+        )
+        logger.info("Zapisano konfigurację %s stanowisk.", len(proposal))
+    except ConfigError as exc:
+        logger.error("Nie zapisano konfiguracji stanowisk: %s", exc)
+        messagebox.showerror(
+            "PSU19 Tester — stanowiska",
+            f"Nie udało się zapisać konfiguracji:\n{exc}",
+            parent=root,
+        )
+    if configured:
+        logger.info("Poprzednio skonfigurowane numery seryjne: %s", ", ".join(sorted(configured)))
+    return config
+
+
+def _warn_about_missing_devices(stations, detected, root: tk.Tk) -> None:
+    """Ostrzega, gdy skonfigurowany numer seryjny testera nie jest widoczny w systemie."""
+    if not detected:
+        return
+    available = {serial.upper() for _index, serial in detected}
+    missing = [
+        station.name
+        for station in stations
+        if station.device_serial and station.device_serial.upper() not in available
+    ]
+    if not missing:
+        return
+    logger.warning("Nie znaleziono testerów dla stanowisk: %s", ", ".join(missing))
+    messagebox.showwarning(
+        "PSU19 Tester — testery",
+        "Nie znaleziono testera dla stanowiska: " + ", ".join(missing) + ".\n\n"
+        "Widoczne numery seryjne: " + ", ".join(sorted(available)) + ".\n"
+        "Sprawdź listę stanowisk w panelu inżynieryjnym.",
+        parent=root,
+    )
 
 
 if __name__ == "__main__":

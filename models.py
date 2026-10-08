@@ -214,6 +214,8 @@ class TestResult:
     timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     message: str = ""
     raw_file: str = ""
+    #: Nazwa kanału pomiarowego (np. LEWY/PRAWY). Pusta przy stanowisku jednokanałowym.
+    station: str = ""
 
     @property
     def sample_count(self) -> int:
@@ -236,7 +238,7 @@ class TestResult:
 
     @staticmethod
     def csv_headers(profile_names: Iterable[str]) -> list[str]:
-        headers = ["Data i godzina", "HRID", "Numer seryjny"]
+        headers = ["Data i godzina", "Stanowisko", "HRID", "Numer seryjny"]
         for name in profile_names:
             headers.extend(
                 [
@@ -268,7 +270,12 @@ class TestResult:
         return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:8]
 
     def to_csv_row(self) -> list[str]:
-        row = [self.timestamp, _excel_safe(self.hrid), _excel_safe(self.serial_number)]
+        row = [
+            self.timestamp,
+            _excel_safe(self.station or "-"),
+            _excel_safe(self.hrid),
+            _excel_safe(self.serial_number),
+        ]
         for result in self.profiles:
             row.extend(
                 [

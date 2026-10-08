@@ -51,6 +51,8 @@ class ProgressEvent:
     current: float
     measurement_ok: bool
     settling: bool
+    sample_number: int
+    rated_samples: int
     overall_fraction: float
 
 
@@ -73,23 +75,41 @@ class TestEngine:
         config = self.config
         if not config.dut_precheck_enabled:
             return True, 0.0, ""
+
+        # Konsola potrafi powiedzieć wprost, ile profili PD deklaruje wyrób.
+        # Zero profili = puste gniazdo albo zasilacz bez PD — jedna komenda zamiast trzech.
+        profiles = self.hardware.dut_profile_count()
+        if profiles is not None:
+            if profiles <= 0:
+                return False, 0.0, (
+                    "Nie wykryto zasilacza w gnieździe (tester nie widzi żadnego profilu PD)."
+                )
+            if profiles < len(config.profiles):
+                logger.warning(
+                    "Zasilacz deklaruje %s profili PD, a test wymaga %s.",
+                    profiles, len(config.profiles),
+                )
+            return True, 0.0, ""
+
+        # Konsola nie obsłużyła -p — schodzimy do pomiaru napięcia.
+        measurement = self.hardware.read_measurement()
+        if measurement is not None and measurement.voltage >= config.dut_precheck_min_voltage:
+            return True, measurement.voltage, ""
         if not self.hardware.set_profile(1):
             return False, 0.0, self.hardware.last_error or "Nie ustawiono profilu 5 V."
         if not self.hardware.set_load(0):
             return False, 0.0, self.hardware.last_error or "Nie wyzerowano obciążenia."
         time.sleep(min(0.3, config.profile_settle_seconds))
-        for _ in range(3):
-            measurement = self.hardware.read_measurement()
-            if measurement is not None:
-                if measurement.voltage >= config.dut_precheck_min_voltage:
-                    return True, measurement.voltage, ""
-                return (
-                    False,
-                    measurement.voltage,
-                    f"Nie wykryto zasilacza (zmierzono {measurement.voltage:.2f} V, "
-                    f"próg {config.dut_precheck_min_voltage:.2f} V).",
-                )
-            time.sleep(0.1)
+        measurement = self.hardware.read_measurement()
+        if measurement is not None:
+            if measurement.voltage >= config.dut_precheck_min_voltage:
+                return True, measurement.voltage, ""
+            return (
+                False,
+                measurement.voltage,
+                f"Nie wykryto zasilacza (zmierzono {measurement.voltage:.2f} V, "
+                f"próg {config.dut_precheck_min_voltage:.2f} V).",
+            )
         return False, 0.0, self.hardware.last_error or "Brak odczytu z PM125."
 
     # ----------------------------------------------------------- przebieg
@@ -100,6 +120,7 @@ class TestEngine:
         serial_number: str,
         progress: ProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
+        station: str = "",
     ) -> TestResult:
         if not self.hardware.connected:
             raise ConnectionError("PM125 nie jest połączony.")
@@ -113,14 +134,18 @@ class TestEngine:
         forced_status: FinalStatus | None = None
         final_message = ""
         total = len(config.profiles)
-        planned = config.estimated_test_seconds() or 1.0
 
-        logger.info("Start testu HRID=%s serial=%s", hrid, serial_number)
+        reset_statistics = getattr(self.hardware, "reset_command_statistics", None)
+        if callable(reset_statistics):
+            reset_statistics()
+        logger.info(
+            "Start testu HRID=%s serial=%s stanowisko=%s", hrid, serial_number, station or "-"
+        )
         try:
             for position, profile in enumerate(config.profiles):
                 self._guard(deadline, cancel_event)
                 result = self._run_profile(
-                    profile, position + 1, total, started, planned, deadline, progress, cancel_event
+                    profile, position + 1, total, deadline, progress, cancel_event
                 )
                 results.append(result)
                 if result.status in {
@@ -167,11 +192,27 @@ class TestEngine:
             final_status=final_status,
             duration_seconds=duration,
             message=final_message,
+            station=station,
         )
+        command_seconds = getattr(self.hardware, "average_command_seconds", 0.0)
         logger.info(
-            "Koniec testu serial=%s status=%s czas=%.2fs próbki=%s (%.1f Hz)",
-            serial_number, final_status.value, duration, result.sample_count, result.sampling_rate,
+            "Koniec testu serial=%s status=%s czas=%.2fs próbki=%s (%.1f Hz), "
+            "średnia komenda PM125 %.0f ms",
+            serial_number, final_status.value, duration, result.sample_count,
+            result.sampling_rate, command_seconds * 1000.0,
         )
+        thin = [
+            item.profile.name
+            for item in results
+            if item.status in {ProfileStatus.PASS, ProfileStatus.FAIL}
+            and min(len(item.rated_no_load), len(item.rated_loaded)) <= config.minimum_samples
+        ]
+        if thin:
+            logger.warning(
+                "Mało ocenianych próbek na fazę (profile: %s). Konsola PM125 odpowiada w %.0f ms — "
+                "rozważ skrócenie okna stabilizacji albo wydłużenie faz.",
+                ", ".join(thin), command_seconds * 1000.0,
+            )
         return result
 
     # ------------------------------------------------------------- profile
@@ -181,8 +222,6 @@ class TestEngine:
         profile: TestProfile,
         number: int,
         total: int,
-        test_started: float,
-        planned_seconds: float,
         deadline: float,
         progress: ProgressCallback | None,
         cancel_event: threading.Event | None,
@@ -205,7 +244,7 @@ class TestEngine:
         try:
             self._collect(
                 result, profile, loaded=False, duration=profile.no_load_seconds,
-                number=number, total=total, test_started=test_started, planned=planned_seconds,
+                number=number, total=total, phase_number=2 * number - 1, phase_total=2 * total,
                 deadline=deadline, progress=progress, cancel_event=cancel_event,
             )
 
@@ -217,7 +256,7 @@ class TestEngine:
 
             self._collect(
                 result, profile, loaded=True, duration=profile.load_seconds,
-                number=number, total=total, test_started=test_started, planned=planned_seconds,
+                number=number, total=total, phase_number=2 * number, phase_total=2 * total,
                 deadline=deadline, progress=progress, cancel_event=cancel_event,
             )
             result.finalize(self.config.minimum_samples)
@@ -245,19 +284,39 @@ class TestEngine:
         duration: float,
         number: int,
         total: int,
-        test_started: float,
-        planned: float,
+        phase_number: int,
+        phase_total: int,
         deadline: float,
         progress: ProgressCallback | None,
         cancel_event: threading.Event | None,
     ) -> None:
+        """Zbiera próbki przez `duration` sekund.
+
+        Czas próbki liczony jest od MOMENTU ROZPOCZĘCIA odczytu, nie jego zakończenia —
+        przy konsoli odpowiadającej w kilkaset ms różnica decyduje o tym, czy próbka
+        z transjentu trafi do oceny.
+        """
         phase_started = time.monotonic()
         phase_deadline = phase_started + duration
         settling_window = self.config.settling_ignore_seconds
+        settling_samples = self.config.settling_ignore_samples
+        minimum = self.config.minimum_samples
         consecutive_errors = 0
+        index = 0
+        rated = 0
 
-        while time.monotonic() < phase_deadline:
+        while True:
+            now = time.monotonic()
+            if now >= phase_deadline:
+                break
+            # Nie rozpoczynamy odczytu, który i tak wybiegnie poza fazę, o ile mamy
+            # już komplet ocenianych próbek — inaczej każda faza rosłaby o czas komendy.
+            expected = self.hardware.average_command_seconds
+            if expected > 0 and rated >= minimum and phase_deadline - now < expected * 0.75:
+                break
+
             self._guard(deadline, cancel_event)
+            sample_started = time.monotonic()
             raw = self.hardware.read_measurement()
             self._guard(deadline, cancel_event)
             if raw is None:
@@ -269,14 +328,19 @@ class TestEngine:
                     )
             else:
                 consecutive_errors = 0
-                elapsed = time.monotonic() - phase_started
-                # Okno stabilizacji: probka jest rejestrowana, ale nie wchodzi do oceny.
-                settling = elapsed < settling_window
+                elapsed = sample_started - phase_started
+                # Okno stabilizacji: próbka jest rejestrowana, ale nie wchodzi do oceny.
+                # Warunek czasowy dla szybkiej konsoli, warunek indeksowy dla wolnej.
+                settling = elapsed < settling_window or index < settling_samples
                 measurement = Measurement(elapsed, raw.voltage, raw.current, settling=settling)
                 result.add(measurement, loaded=loaded)
+                index += 1
+                if not settling:
+                    rated += 1
                 measurement_ok = not profile.violation(raw.voltage, raw.current, loaded)
                 if progress:
                     try:
+                        phase_fraction = min(1.0, max(0.0, (time.monotonic() - phase_started) / duration))
                         progress(
                             ProgressEvent(
                                 profile_name=profile.name,
@@ -288,9 +352,9 @@ class TestEngine:
                                 current=raw.current,
                                 measurement_ok=measurement_ok,
                                 settling=settling,
-                                overall_fraction=min(
-                                    1.0, (time.monotonic() - test_started) / planned
-                                ),
+                                sample_number=index,
+                                rated_samples=rated,
+                                overall_fraction=(phase_number - 1 + phase_fraction) / phase_total,
                             )
                         )
                     except Exception:

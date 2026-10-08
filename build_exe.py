@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "PSU19_Tester"
-VERSION = "4.0.0"
+VERSION = "5.0.0"
 COMPANY = "Reconext"
 DESCRIPTION = "PSU USB-C PD Tester (PM125)"
 
@@ -28,7 +28,8 @@ SPEC = ROOT / "build" / "spec"
 #: Moduly aplikacji - plaska struktura, więc wszystkie leza obok app.py.
 MODULES = [
     "config.py", "engine.py", "hardware.py", "logging_utils.py",
-    "models.py", "settings_ui.py", "storage.py", "theme.py", "ui.py",
+    "loop_test.py", "loop_ui.py", "models.py", "settings_ui.py",
+    "station_panel.py", "storage.py", "theme.py", "ui.py",
 ]
 OPTIONAL_ICONS = ("reconext_logo.ico", "icon.ico")
 

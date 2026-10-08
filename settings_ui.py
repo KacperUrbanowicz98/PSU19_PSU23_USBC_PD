@@ -8,7 +8,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
-from config import AppConfig, ConfigError
+from config import AppConfig, ConfigError, StationConfig, stations_from_devices
+from hardware import find_devices
 from models import TestProfile
 from storage import AttemptStore
 from theme import COLORS
@@ -28,6 +29,7 @@ class SettingsDialog:
         attempts: AttemptStore | None = None,
         is_busy: Callable[[], bool] | None = None,
         operator_hrid: str | None = None,
+        open_loop: Callable[[], None] | None = None,
     ) -> None:
         self.config = config
         self.config_path = config_path
@@ -35,20 +37,30 @@ class SettingsDialog:
         self.attempts = attempts
         self.is_busy = is_busy or (lambda: False)
         self.operator_hrid = operator_hrid
+        self.open_loop = open_loop
         self.profiles = [replace(item) for item in config.profiles]
+        self.stations = [replace(item) for item in config.stations]
 
         self.window = tk.Toplevel(parent)
         self.window.title("Panel inżynieryjny — PSU USB-C Tester")
-        self.window.geometry("1300x1000")
-        self.window.minsize(1040, 700)
+        # Rozmiar dopasowany do ekranu — na 1080p okno 1300x1000 chowało stopkę
+        # z przyciskiem ZAPISZ USTAWIENIA poza dolną krawędzią.
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        width = max(900, min(1300, screen_width - 80))
+        height = max(600, min(1000, screen_height - 140))
+        self.window.geometry(f"{width}x{height}")
+        self.window.minsize(min(1040, width), min(640, height))
         self.window.transient(parent)
         self.window.configure(bg=COLORS["background"])
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
 
         self._configure_styles()
         self._build_header()
-        self._build_content()
+        # Stopka pakowana PRZED zakładkami i przypięta do dołu — dzięki temu przyciski
+        # zapisu są widoczne nawet wtedy, gdy zawartość zakładki jest wyższa niż okno.
         self._build_footer()
+        self._build_content()
         self._center_window(parent)
 
     def exists(self) -> bool:
@@ -150,18 +162,21 @@ class SettingsDialog:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
         general_tab = ttk.Frame(self.notebook, style="Settings.TFrame")
+        stations_tab = ttk.Frame(self.notebook, style="Settings.TFrame")
         profiles_tab = ttk.Frame(self.notebook, style="Settings.TFrame")
         hrid_tab = ttk.Frame(self.notebook, style="Settings.TFrame")
         attempts_tab = ttk.Frame(self.notebook, style="Settings.TFrame")
         logs_tab = ttk.Frame(self.notebook, style="Settings.TFrame")
         self.notebook.add(general_tab, text="  Ogólne  ")
+        self.notebook.add(stations_tab, text="  Stanowiska  ")
         self.notebook.add(profiles_tab, text="  Profile testowe  ")
         self.notebook.add(hrid_tab, text="  Operatorzy HRID  ")
         self.notebook.add(attempts_tab, text="  Liczniki prób  ")
         self.notebook.add(logs_tab, text="  Logi  ")
 
-        self.general_vars = self._build_general(general_tab)
-        self._build_profiles(profiles_tab)
+        self.general_vars = self._build_general(self._scrollable(general_tab))
+        self._build_stations(self._scrollable(stations_tab))
+        self._build_profiles(self._scrollable(profiles_tab))
         self._build_hrids(hrid_tab)
         self._build_attempts(attempts_tab)
         self._build_logs(logs_tab)
@@ -170,7 +185,7 @@ class SettingsDialog:
 
     def _build_footer(self) -> None:
         footer = tk.Frame(self.window, bg=COLORS["background"])
-        footer.pack(fill=tk.X, padx=22, pady=(0, 18))
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=22, pady=(10, 16))
 
         self.footer_label = tk.Label(
             footer,
@@ -178,6 +193,13 @@ class SettingsDialog:
             bg=COLORS["background"], fg=COLORS["muted"], font=("Segoe UI", 9),
         )
         self.footer_label.pack(side=tk.LEFT)
+
+        if self.open_loop is not None:
+            # Tryb walidacyjny jest dostępny wyłącznie stąd, czyli po haśle inżynieryjnym.
+            self._button(
+                footer, "TRYB WALIDACYJNY (LOOP)", self._start_loop,
+                COLORS["warning"], COLORS["warning_hover"], padx=20, pady=9,
+            ).pack(side=tk.LEFT, padx=(24, 0))
 
         self._button(
             footer, "ANULUJ", self.window.destroy, COLORS["card"], COLORS["primary_soft"],
@@ -188,9 +210,31 @@ class SettingsDialog:
             font_size=10, padx=24, pady=9,
         ).pack(side=tk.RIGHT)
 
+    def _start_loop(self) -> None:
+        """Otwiera serię walidacyjną. Niezapisane zmiany konfiguracji zostają porzucone."""
+        if self.open_loop is None:
+            return
+        if self.is_busy():
+            messagebox.showwarning(
+                "Tryb walidacyjny", "Trwa test zasilacza. Poczekaj na jego zakończenie.",
+                parent=self.window,
+            )
+            return
+        if not messagebox.askyesno(
+            "Tryb walidacyjny",
+            "Otworzyć tryb walidacyjny?\n\n"
+            "Panel ustawień zostanie zamknięty, a niezapisane zmiany konfiguracji przepadną.",
+            parent=self.window,
+        ):
+            return
+        logger.info("Panel inżynieryjny: otwarcie trybu walidacyjnego (operator=%s).",
+                    self.operator_hrid or "-")
+        self.window.destroy()
+        self.open_loop()
+
     # ------------------------------------------------------------- Ogólne
 
-    def _build_general(self, parent: ttk.Frame) -> dict[str, tk.Variable]:
+    def _build_general(self, parent: tk.Widget) -> dict[str, tk.Variable]:
         text_values = {
             "console_path": self.config.console_path,
             "device_serial": self.config.device_serial or "",
@@ -203,6 +247,8 @@ class SettingsDialog:
             "profile_settle_seconds": str(self.config.profile_settle_seconds),
             "load_settle_seconds": str(self.config.load_settle_seconds),
             "settling_ignore_seconds": str(self.config.settling_ignore_seconds),
+            "settling_ignore_samples": str(self.config.settling_ignore_samples),
+            "command_overhead_seconds": str(self.config.command_overhead_seconds),
             "command_timeout": str(self.config.command_timeout),
             "test_timeout": str(self.config.test_timeout),
             "minimum_samples": str(self.config.minimum_samples),
@@ -281,6 +327,8 @@ class SettingsDialog:
             ("profile_settle_seconds", "Stabilizacja profilu", "s"),
             ("load_settle_seconds", "Stabilizacja obciążenia", "s"),
             ("settling_ignore_seconds", "Okno nieoceniane po zmianie", "s"),
+            ("settling_ignore_samples", "Nieoceniane pierwsze próbki", "szt."),
+            ("command_overhead_seconds", "Czas komendy PM125", "s"),
             ("command_timeout", "Timeout komendy", "s"),
             ("test_timeout", "Timeout całego testu", "s"),
             ("minimum_samples", "Min. liczba próbek", "na fazę"),
@@ -359,17 +407,229 @@ class SettingsDialog:
             )
             return
         seconds = preview.estimated_test_seconds()
+        samples = preview.estimated_samples_per_phase()
+        rated = max(0, samples - preview.settling_ignore_samples)
         self.estimate_label.config(
             text=(
-                f"Szacowany czas samego testu: {seconds:.1f} s "
-                f"(+ okno wyniku {preview.result_window_pass_seconds:g} s dla PASS).\n"
-                f"Timeout całego testu: {preview.test_timeout:g} s."
+                f"Pomiary: {preview.measurement_seconds():.1f} s   ·   "
+                f"komendy PM125: {preview.command_count_estimate()} × "
+                f"{preview.command_overhead_seconds:g} s\n"
+                f"Szacowany czas testu: {seconds:.1f} s (+ okno wyniku "
+                f"{preview.result_window_pass_seconds:g} s dla PASS), timeout "
+                f"{preview.test_timeout:g} s.\n"
+                f"Próbki na fazę: ~{samples}, w tym oceniane {rated} "
+                f"(wymagane {preview.minimum_samples})."
             )
         )
 
+    # ---------------------------------------------------------- Stanowiska
+
+    def _build_stations(self, parent: tk.Widget) -> None:
+        body = tk.Frame(parent, bg=COLORS["background"])
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        card = self._card(body)
+        card.pack(fill=tk.X)
+        self._section_title(
+            card, "Kanały pomiarowe",
+            "Jedno stanowisko = jedna kolumna w oknie operatora. Przy dwóch kanałach każdy "
+            "tester musi mieć podany numer seryjny — adres „Any” wybrałby to samo urządzenie.",
+        )
+
+        toolbar = tk.Frame(card, bg=COLORS["card"])
+        toolbar.pack(fill=tk.X, padx=18, pady=(2, 8))
+        self.detected_label = tk.Label(
+            toolbar, text="", bg=COLORS["primary_soft"], fg=COLORS["primary"],
+            font=("Segoe UI", 9, "bold"), padx=11, pady=6,
+        )
+        self.detected_label.pack(side=tk.LEFT)
+        self._button(
+            toolbar, "WYKRYJ TESTERY", self._detect_devices, COLORS["primary"],
+            COLORS["primary_hover"], padx=16, pady=7,
+        ).pack(side=tk.RIGHT)
+        self._button(
+            toolbar, "UŻYJ WYKRYTYCH", self._use_detected_devices, COLORS["success"],
+            COLORS["success_hover"], padx=16, pady=7,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        tree_area = tk.Frame(card, bg=COLORS["card"])
+        tree_area.pack(fill=tk.X, padx=18, pady=(0, 16))
+        columns = ("name", "serial", "enabled")
+        self.station_tree = ttk.Treeview(
+            tree_area, columns=columns, show="headings", height=3,
+            style="Settings.Treeview", selectmode="browse",
+        )
+        for column, heading, width in (
+            ("name", "Nazwa stanowiska", 220),
+            ("serial", "Numer seryjny testera", 260),
+            ("enabled", "Aktywne", 110),
+        ):
+            self.station_tree.heading(column, text=heading)
+            self.station_tree.column(column, width=width, anchor=tk.CENTER)
+        self.station_tree.pack(fill=tk.X)
+        self.station_tree.bind("<<TreeviewSelect>>", self._load_selected_station)
+
+        editor_card = self._card(body)
+        editor_card.pack(fill=tk.X, pady=(14, 0))
+        self._section_title(editor_card, "Edycja stanowiska", "Zmiana liczby kanałów wymaga restartu aplikacji")
+        editor = tk.Frame(editor_card, bg=COLORS["card"])
+        editor.pack(fill=tk.X, padx=18, pady=(2, 10))
+        editor.columnconfigure(1, weight=1)
+
+        self.station_vars = {
+            "name": tk.StringVar(),
+            "device_serial": tk.StringVar(),
+            "enabled": tk.BooleanVar(value=True),
+        }
+        for row, (key, label) in enumerate((("name", "Nazwa"), ("device_serial", "Numer seryjny testera"))):
+            tk.Label(
+                editor, text=label, bg=COLORS["card"], fg=COLORS["text"],
+                font=("Segoe UI", 9), anchor="w",
+            ).grid(row=row, column=0, sticky="w", pady=7, padx=(0, 12))
+            ttk.Entry(
+                editor, textvariable=self.station_vars[key], style="Settings.TEntry",
+                font=("Segoe UI", 10),
+            ).grid(row=row, column=1, sticky="ew", pady=7)
+        ttk.Checkbutton(
+            editor, text="Stanowisko aktywne", variable=self.station_vars["enabled"],
+            style="Settings.TCheckbutton",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        actions = tk.Frame(editor_card, bg=COLORS["card"])
+        actions.pack(fill=tk.X, padx=18, pady=(0, 16))
+        self._button(
+            actions, "ZASTOSUJ ZMIANY", self._apply_station, COLORS["primary"],
+            COLORS["primary_hover"], padx=18, pady=8,
+        ).pack(side=tk.LEFT)
+        self._button(
+            actions, "DODAJ STANOWISKO", self._add_station, COLORS["success"],
+            COLORS["success_hover"], padx=18, pady=8,
+        ).pack(side=tk.LEFT, padx=8)
+        self._button(
+            actions, "USUŃ STANOWISKO", self._remove_station, COLORS["error"],
+            COLORS["error_hover"], padx=18, pady=8,
+        ).pack(side=tk.RIGHT)
+
+        self._refresh_station_tree()
+        if self.stations:
+            self.station_tree.selection_set("0")
+            self._load_selected_station()
+        self._detect_devices()
+
+    def _detect_devices(self) -> list[tuple[int, str]]:
+        devices = find_devices(self.config.console_path)
+        if devices:
+            listing = ", ".join(f"{index}={serial}" for index, serial in devices)
+            self.detected_label.config(text=f"Wykryte testery: {listing}")
+        else:
+            self.detected_label.config(text="Nie wykryto testerów (komenda -f)")
+        return devices
+
+    def _use_detected_devices(self) -> None:
+        """Jednym kliknięciem tworzy listę stanowisk z faktycznie podłączonych testerów."""
+        devices = self._detect_devices()
+        if not devices:
+            messagebox.showwarning(
+                "Stanowiska",
+                "Nie wykryto żadnego testera. Sprawdź połączenie USB i ścieżkę do "
+                "USBPDConsole.exe w zakładce Ogólne.",
+                parent=self.window,
+            )
+            return
+        proposal = stations_from_devices(devices)
+        listing = "\n".join(f"  • {item.name} — {item.device_serial}" for item in proposal)
+        if not messagebox.askyesno(
+            "Stanowiska",
+            f"Zastąpić listę stanowisk wykrytymi testerami?\n\n{listing}\n\n"
+            "Nazwy możesz potem zmienić. Zmiana liczby stanowisk wymaga ponownego "
+            "uruchomienia aplikacji.",
+            parent=self.window,
+        ):
+            return
+        self.stations = proposal
+        self._refresh_station_tree()
+        self.station_tree.selection_set("0")
+        self._load_selected_station()
+        self._show_inline_notice(
+            f"Ustawiono {len(proposal)} stanowisk(a).", COLORS["success"], COLORS["success_soft"]
+        )
+
+    def _refresh_station_tree(self) -> None:
+        for item in self.station_tree.get_children():
+            self.station_tree.delete(item)
+        for index, station in enumerate(self.stations):
+            self.station_tree.insert(
+                "", tk.END, iid=str(index),
+                values=(
+                    station.name,
+                    station.device_serial or "Any (pierwszy wykryty)",
+                    "TAK" if station.enabled else "nie",
+                ),
+            )
+
+    def _load_selected_station(self, _event=None) -> None:
+        selection = self.station_tree.selection()
+        if not selection:
+            return
+        station = self.stations[int(selection[0])]
+        self.station_vars["name"].set(station.name)
+        self.station_vars["device_serial"].set(station.device_serial or "")
+        self.station_vars["enabled"].set(station.enabled)
+
+    def _apply_station(self, silent: bool = False) -> None:
+        selection = self.station_tree.selection()
+        if not selection:
+            if not silent:
+                messagebox.showwarning("Stanowiska", "Wybierz stanowisko do edycji.", parent=self.window)
+            return
+        serial = self.station_vars["device_serial"].get().strip()
+        self.stations[int(selection[0])] = StationConfig(
+            name=self.station_vars["name"].get().strip() or "STANOWISKO",
+            device_serial=serial or None,
+            enabled=bool(self.station_vars["enabled"].get()),
+        )
+        selected = selection[0]
+        self._refresh_station_tree()
+        self.station_tree.selection_set(selected)
+        if not silent:
+            self._show_inline_notice("Stanowisko zaktualizowane.", COLORS["success"], COLORS["success_soft"])
+
+    def _add_station(self) -> None:
+        if len(self.stations) >= 4:
+            messagebox.showwarning("Stanowiska", "Obsługiwane są maksymalnie 4 stanowiska.", parent=self.window)
+            return
+        default_names = ["LEWY", "PRAWY", "TRZECI", "CZWARTY"]
+        name = default_names[len(self.stations)] if len(self.stations) < 4 else f"STANOWISKO {len(self.stations) + 1}"
+        self.stations.append(StationConfig(name, None, True))
+        self._refresh_station_tree()
+        selected = str(len(self.stations) - 1)
+        self.station_tree.selection_set(selected)
+        self._load_selected_station()
+
+    def _remove_station(self) -> None:
+        selection = self.station_tree.selection()
+        if not selection:
+            messagebox.showwarning("Stanowiska", "Wybierz stanowisko do usunięcia.", parent=self.window)
+            return
+        if len(self.stations) <= 1:
+            messagebox.showwarning("Stanowiska", "Musi zostać co najmniej jedno stanowisko.", parent=self.window)
+            return
+        index = int(selection[0])
+        if not messagebox.askyesno(
+            "Usuń stanowisko",
+            f"Usunąć stanowisko „{self.stations[index].name}”?",
+            parent=self.window,
+        ):
+            return
+        del self.stations[index]
+        self._refresh_station_tree()
+        if self.stations:
+            self.station_tree.selection_set(str(min(index, len(self.stations) - 1)))
+            self._load_selected_station()
+
     # ------------------------------------------------------------- Profile
 
-    def _build_profiles(self, parent: ttk.Frame) -> None:
+    def _build_profiles(self, parent: tk.Widget) -> None:
         body = tk.Frame(parent, bg=COLORS["background"])
         body.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
 
@@ -748,6 +1008,8 @@ class SettingsDialog:
             profile_settle_seconds=_float(v["profile_settle_seconds"].get()),
             load_settle_seconds=_float(v["load_settle_seconds"].get()),
             settling_ignore_seconds=_float(v["settling_ignore_seconds"].get()),
+            settling_ignore_samples=int(v["settling_ignore_samples"].get()),
+            command_overhead_seconds=_float(v["command_overhead_seconds"].get()),
             command_timeout=_float(v["command_timeout"].get()),
             test_timeout=_float(v["test_timeout"].get()),
             minimum_samples=int(v["minimum_samples"].get()),
@@ -766,6 +1028,7 @@ class SettingsDialog:
             log_retention_days=int(v["log_retention_days"].get()),
             debug_logging=bool(v["debug_logging"].get()),
             profiles=list(self.profiles),
+            stations=list(self.stations),
             valid_hrids=hrids,
         )
 
@@ -781,6 +1044,8 @@ class SettingsDialog:
         try:
             if self.profile_tree.selection():
                 self._apply_profile(silent=True)
+            if self.station_tree.selection():
+                self._apply_station(silent=True)
             new_config = self._collect_config()
             changes = self.config.diff(new_config)
             note = (
@@ -804,6 +1069,44 @@ class SettingsDialog:
         )
         notice.place(relx=0.5, rely=0.105, anchor="n")
         self.window.after(1600, notice.destroy)
+
+    def _scrollable(self, parent: tk.Widget) -> tk.Frame:
+        """Zwraca ramkę przewijaną w pionie — zawartość zakładki bywa wyższa niż okno."""
+        canvas = tk.Canvas(
+            parent, bg=COLORS["background"], highlightthickness=0, borderwidth=0
+        )
+        scrollbar = ttk.Scrollbar(
+            parent, orient=tk.VERTICAL, command=canvas.yview, style="Settings.Vertical.TScrollbar"
+        )
+        inner = tk.Frame(canvas, bg=COLORS["background"])
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def resize(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window_id, width=canvas.winfo_width())
+
+        inner.bind("<Configure>", resize)
+        canvas.bind("<Configure>", resize)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def wheel(event) -> None:
+            step = -1 if getattr(event, "delta", 0) > 0 or event.num == 4 else 1
+            canvas.yview_scroll(step, "units")
+
+        for widget in (canvas, inner):
+            widget.bind("<Enter>", lambda _e: (
+                canvas.bind_all("<MouseWheel>", wheel),
+                canvas.bind_all("<Button-4>", wheel),
+                canvas.bind_all("<Button-5>", wheel),
+            ))
+            widget.bind("<Leave>", lambda _e: (
+                canvas.unbind_all("<MouseWheel>"),
+                canvas.unbind_all("<Button-4>"),
+                canvas.unbind_all("<Button-5>"),
+            ))
+        return inner
 
     def _card(self, parent: tk.Widget) -> tk.Frame:
         return tk.Frame(
@@ -847,12 +1150,14 @@ class SettingsDialog:
         return button
 
     def _center_window(self, parent: tk.Tk) -> None:
+        """Ustawia okno na środku ekranu, nigdy poza jego krawędziami."""
         self.window.update_idletasks()
-        width = max(self.window.winfo_width(), 1120)
-        height = max(self.window.winfo_height(), 760)
-        parent.update_idletasks()
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 2)
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        width = min(max(self.window.winfo_width(), 1040), screen_width - 60)
+        height = min(max(self.window.winfo_height(), 640), screen_height - 120)
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 3)
         self.window.geometry(f"{width}x{height}+{x}+{y}")
 
     @staticmethod

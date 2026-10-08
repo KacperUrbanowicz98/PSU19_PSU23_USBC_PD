@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from config import AppConfig, ConfigError
+from config import AppConfig, ConfigError, StationConfig, station_names_for, stations_from_devices
 from engine import TestEngine
 from hardware import PM125Client, SimulatedPM125
 from models import (
@@ -26,6 +26,7 @@ from models import (
     TestProfile,
     TestResult,
 )
+from loop_test import LoopReportWriter, LoopRunner, build_report_lines
 from storage import AttemptStore, CsvResultRepository, PendingRecord, PendingResultStore, RawSampleWriter
 
 
@@ -42,10 +43,15 @@ class FakeHardware:
         read_error: bool = False,
         ramp_seconds: float = 0.0,
         fail_profile_index: int | None = None,
+        follow_profile: bool = False,
+        offset: float = 0.0,
     ) -> None:
         self.connected = True
         self.last_error = ""
         self.voltage = voltage
+        #: Gdy True, atrapa zwraca napięcie nominalne ustawionego profilu (+ offset).
+        self.follow_profile = follow_profile
+        self.offset = offset
         self.current_follows_load = current_follows_load
         self.read_error = read_error
         self.ramp_seconds = ramp_seconds
@@ -55,6 +61,8 @@ class FakeHardware:
         self.load_changed_at = time.monotonic()
         self.reset_calls = 0
         self.zero_load_calls = 0
+        self.command_calls = 0
+        self.command_seconds = 0.0
 
     def connect(self) -> bool:
         return True
@@ -65,17 +73,37 @@ class FakeHardware:
     def ping(self) -> bool:
         return self.connected
 
-    def set_profile(self, index: int) -> bool:
+    def set_profile(self, index: int, force: bool = False) -> bool:
         self.profile_index = index
         self.load_changed_at = time.monotonic()
+        self.command_calls += 1
         return True
 
-    def set_load(self, current_ma: int) -> bool:
+    def set_load(self, current_ma: int, force: bool = False) -> bool:
         if current_ma == 0:
             self.zero_load_calls += 1
         self.load_ma = current_ma
         self.load_changed_at = time.monotonic()
+        self.command_calls += 1
         return True
+
+    def dut_profile_count(self) -> int | None:
+        if self.read_error:
+            return None
+        return 0 if self.voltage <= 0.5 and not self.follow_profile else 4
+
+    def read_configuration(self) -> str | None:
+        return "CABLE RESISTANCE: 80 Ohms\nHOLD LOAD ON VOLTAGE CHANGES: DISABLED"
+
+    @property
+    def average_command_seconds(self) -> float:
+        return self.command_seconds
+
+    def reset_command_statistics(self) -> None:
+        self.command_calls = 0
+
+    def forget_state(self) -> None:
+        pass
 
     def read_measurement(self) -> Measurement | None:
         if self.read_error or (
@@ -87,7 +115,10 @@ class FakeHardware:
         if self.ramp_seconds > 0:
             elapsed = time.monotonic() - self.load_changed_at
             target *= min(1.0, elapsed / self.ramp_seconds)
-        return Measurement(0.0, self.voltage, target)
+        voltage = self.voltage
+        if self.follow_profile:
+            voltage = {1: 5.0, 2: 9.0, 3: 12.0, 4: 15.0}.get(self.profile_index, 5.0) + self.offset
+        return Measurement(0.0, voltage, target)
 
     def safe_reset(self) -> bool:
         self.reset_calls += 1
@@ -484,6 +515,280 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertAlmostEqual(measurement_only, 20.0, places=3)
         self.assertLess(config.estimated_test_seconds(), config.test_timeout)
+
+
+class SlowConsoleTests(unittest.TestCase):
+    """Zachowanie przy konsoli PM125 odpowiadającej w kilkaset ms."""
+
+    def test_settling_sample_count_protects_slow_console(self) -> None:
+        """Przy wolnej konsoli pierwsza próbka fazy i tak nie może być oceniana."""
+        profile = TestProfile("5V", 1, 5.0, 4.75, 5.50, 2.5, 2.5, 3000)
+        config = AppConfig()
+        config.profiles = [profile]
+        config.measurement_interval = 0.01
+        config.profile_settle_seconds = 0.0
+        config.load_settle_seconds = 0.0
+        config.settling_ignore_seconds = 0.0   # okno czasowe wyłączone
+        config.settling_ignore_samples = 1     # zostaje zabezpieczenie indeksowe
+        hardware = FakeHardware(ramp_seconds=0.9)
+        hardware.command_seconds = 0.0
+        result = TestEngine(config, hardware).run("TEST", "SN00001")
+        first_loaded = result.profiles[0].loaded[0]
+        self.assertTrue(first_loaded.settling)
+        self.assertNotIn(first_loaded, result.profiles[0].rated_loaded)
+
+    def test_phase_does_not_overrun_when_samples_are_complete(self) -> None:
+        """Faza nie przeciąga się o czas komendy, gdy komplet próbek już jest."""
+        profile = TestProfile("5V", 1, 5.0, 4.75, 5.50, 1.0, 1.0, 3000)
+        config = AppConfig()
+        config.profiles = [profile]
+        config.measurement_interval = 0.0001
+        config.profile_settle_seconds = 0.0
+        config.load_settle_seconds = 0.0
+        config.settling_ignore_seconds = 0.0
+        config.settling_ignore_samples = 0
+        config.minimum_samples = 2
+        hardware = FakeHardware()
+        hardware.command_seconds = 0.3  # deklarowany czas komendy
+        result = TestEngine(config, hardware).run("TEST", "SN00001")
+        # 2 fazy po 1 s: bez wcześniejszego kończenia test trwałby wyraźnie dłużej.
+        self.assertLess(result.duration_seconds, 2.3)
+        self.assertIs(result.final_status, FinalStatus.PASS)
+
+    def test_config_rejects_setup_without_enough_rated_samples(self) -> None:
+        """Konfiguracja, w której nie zmieszczą się oceniane próbki, jest błędem."""
+        config = AppConfig()
+        config.command_overhead_seconds = 2.0   # jedna próbka na fazę
+        config.settling_ignore_samples = 1
+        config.minimum_samples = 2
+        errors = config.validate()
+        self.assertTrue(any("ocenianych" in item for item in errors), errors)
+
+    def test_estimate_includes_command_overhead(self) -> None:
+        config = AppConfig()
+        self.assertGreater(config.estimated_test_seconds(), config.measurement_seconds())
+        self.assertEqual(config.measurement_seconds(), 20.0)
+
+
+class LoopValidationTests(unittest.TestCase):
+    """Tryb walidacyjny: seria, statystyka i raport."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.root = Path(self._temp.name)
+        self.config = fast_config()
+        self.config.validation_directory = str(self.root / "validation")
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def test_series_counts_and_does_not_touch_attempts(self) -> None:
+        engine = TestEngine(self.config, FakeHardware(follow_profile=True))
+        summary, results = LoopRunner(self.config, engine).run(
+            label="WAL", hrid="TEST", cycles=3, pause_seconds=0.0
+        )
+        self.assertEqual(summary.cycles_done, 3)
+        self.assertEqual(summary.passed, 3)
+        self.assertEqual(len(results), 3)
+        self.assertTrue(summary.repeatable)
+        # Seria nie korzysta z licznika prób ani z repozytorium produkcyjnego.
+        self.assertFalse((self.root / "serial_attempts.json").exists())
+        self.assertFalse((self.root / "reports").exists())
+
+    def test_margin_and_statistics(self) -> None:
+        """Zapas do granic liczony jest z najgorszego pomiaru serii."""
+        # +0,4 V do nominału: 9 V wychodzi 9,40 przy granicy 9,45 — zapas 50 mV.
+        engine = TestEngine(self.config, FakeHardware(follow_profile=True, offset=0.4))
+        summary, _ = LoopRunner(self.config, engine).run(
+            label="WAL", hrid="TEST", cycles=3, pause_seconds=0.0
+        )
+        worst = summary.worst_phase
+        self.assertIsNotNone(worst)
+        self.assertLess(worst.worst_margin, 0.1)
+        self.assertGreater(worst.worst_margin, 0.0)
+        for item in summary.phases:
+            self.assertGreater(item.samples, 0)
+            self.assertLessEqual(item.minimum, item.average)
+            self.assertLessEqual(item.average, item.maximum)
+
+    def test_error_cycles_mark_station_not_ready(self) -> None:
+        engine = TestEngine(self.config, FakeHardware(read_error=True))
+        summary, _ = LoopRunner(self.config, engine).run(
+            label="WAL", hrid="TEST", cycles=2, pause_seconds=0.0
+        )
+        self.assertEqual(summary.errors, 2)
+        report = "\n".join(build_report_lines(summary))
+        self.assertIn("NIEGOTOWE", report)
+
+    def test_cancelled_series_is_marked(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        engine = TestEngine(self.config, FakeHardware(follow_profile=True))
+        summary, _ = LoopRunner(self.config, engine).run(
+            label="WAL", hrid="TEST", cycles=5, pause_seconds=0.0, cancel_event=cancel
+        )
+        self.assertTrue(summary.cancelled)
+        self.assertEqual(summary.cycles_done, 0)
+
+    def test_report_files_are_written(self) -> None:
+        engine = TestEngine(self.config, FakeHardware(follow_profile=True))
+        summary, results = LoopRunner(self.config, engine).run(
+            label="WAL 001", hrid="TEST", cycles=2, pause_seconds=0.0
+        )
+        data_path, report_path = LoopReportWriter(self.config.validation_path).write(summary, results)
+        self.assertTrue(data_path.exists())
+        self.assertTrue(report_path.exists())
+        report = report_path.read_text(encoding="utf-8")
+        self.assertIn("RAPORT WALIDACYJNY", report)
+        self.assertIn("POWTARZALNOŚĆ STANOWISKA", report)
+        rows = data_path.read_text(encoding="utf-8-sig").splitlines()
+        self.assertEqual(len(rows), 3)          # nagłówek + 2 cykle
+        self.assertTrue(rows[0].startswith("Cykl;"))
+
+    def test_drift_is_detected(self) -> None:
+        """Rosnące napięcie w kolejnych cyklach ma dawać dodatni trend (mV/cykl)."""
+
+        class DriftingHardware(FakeHardware):
+            """Odwzorowuje nagrzewanie się wyrobu: każdy cykl o 10 mV wyżej."""
+
+            def __init__(self) -> None:
+                super().__init__(follow_profile=True)
+                self.cycles = 0
+
+            def set_profile(self, index: int, force: bool = False) -> bool:
+                if index == 1:
+                    self.cycles += 1
+                    self.offset = 0.01 * self.cycles
+                return super().set_profile(index, force)
+
+        config = fast_config()
+        config.profiles = [config.profiles[0]]
+        engine = TestEngine(config, DriftingHardware())
+        summary, _ = LoopRunner(config, engine).run(
+            label="WAL", hrid="TEST", cycles=4, pause_seconds=0.0
+        )
+        drift = summary.phases[0].drift_mv_per_cycle
+        self.assertGreater(drift, 5.0)
+
+
+class StationTests(unittest.TestCase):
+    """Konfiguracja wielokanałowa i ochrona przed tą samą sztuką na dwóch gniazdach."""
+
+    def test_single_station_by_default(self) -> None:
+        config = AppConfig()
+        self.assertEqual(len(config.active_stations()), 1)
+        self.assertFalse(config.multi_station)
+        self.assertEqual(config.validate(), [])
+
+    def test_two_stations_need_serial_numbers(self) -> None:
+        config = AppConfig()
+        config.stations = [StationConfig("LEWY"), StationConfig("PRAWY")]
+        errors = config.validate()
+        self.assertTrue(any("numer seryjny" in item for item in errors), errors)
+
+    def test_two_stations_with_serials_are_valid(self) -> None:
+        config = AppConfig()
+        config.stations = [
+            StationConfig("LEWY", "PMPD80LLAD"),
+            StationConfig("PRAWY", "PMPD80LN6E"),
+        ]
+        self.assertEqual(config.validate(), [])
+        self.assertTrue(config.multi_station)
+
+    def test_duplicate_serial_is_rejected(self) -> None:
+        config = AppConfig()
+        config.stations = [
+            StationConfig("LEWY", "PMPD80LLAD"),
+            StationConfig("PRAWY", "PMPD80LLAD"),
+        ]
+        self.assertTrue(any("Powtórzony numer" in item for item in config.validate()))
+
+    def test_legacy_config_migrates_to_single_station(self) -> None:
+        """Stara konfiguracja z device_serial ma dać jedno stanowisko."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test_config.json"
+            payload = AppConfig().to_payload()
+            payload.pop("stations")
+            payload["device_serial"] = "PMPD80LLAD"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            config, warnings = AppConfig.load(path)
+        self.assertEqual(len(config.stations), 1)
+        self.assertEqual(config.stations[0].device_serial, "PMPD80LLAD")
+        self.assertTrue(any("jednokanałowa" in item for item in warnings))
+
+    def test_serial_cannot_run_on_two_stations_at_once(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = AttemptStore(Path(folder) / "attempts.json")
+            self.assertIsNone(store.reserve("SN00001", "LEWY"))
+            self.assertEqual(store.reserve("SN00001", "PRAWY"), "LEWY")
+            store.release("SN00001", "LEWY")
+            self.assertIsNone(store.reserve("SN00001", "PRAWY"))
+
+    def test_result_carries_station_name(self) -> None:
+        config = fast_config()
+        result = TestEngine(config, FakeHardware(follow_profile=True)).run(
+            "TEST", "SN00001", station="PRAWY"
+        )
+        self.assertEqual(result.station, "PRAWY")
+        headers = TestResult.csv_headers(result.profile_names)
+        self.assertEqual(headers[1], "Stanowisko")
+        self.assertEqual(result.to_csv_row()[1], "PRAWY")
+
+    def test_precheck_uses_profile_count(self) -> None:
+        """Pre-kontrola pyta tester o liczbę profili PD zamiast mierzyć napięcie."""
+        config = fast_config()
+        hardware = FakeHardware(voltage=0.0)
+        detected, _voltage, message = TestEngine(config, hardware).detect_dut()
+        self.assertFalse(detected)
+        self.assertIn("profil", message.lower())
+
+
+class DetectedStationTests(unittest.TestCase):
+    """Automatyczna konfiguracja kanałów z wykrytych testerów."""
+
+    def test_names_follow_channel_count(self) -> None:
+        self.assertEqual(station_names_for(1), ["STANOWISKO"])
+        self.assertEqual(station_names_for(2), ["LEWY", "PRAWY"])
+        self.assertEqual(len(station_names_for(3)), 3)
+
+    def test_stations_built_from_find_output(self) -> None:
+        stations = stations_from_devices([(0, "PMPD80LLAD"), (1, "PMPD80LN6E")])
+        self.assertEqual([item.name for item in stations], ["LEWY", "PRAWY"])
+        self.assertEqual([item.device_serial for item in stations], ["PMPD80LLAD", "PMPD80LN6E"])
+        config = AppConfig()
+        config.stations = stations
+        self.assertEqual(config.validate(), [])
+        self.assertTrue(config.multi_station)
+
+
+class ReturnCodeTests(unittest.TestCase):
+    def test_device_lost_codes(self) -> None:
+        from hardware import DEVICE_LOST_CODES, describe_code
+
+        self.assertIn(2, DEVICE_LOST_CODES)
+        self.assertIn(3, DEVICE_LOST_CODES)
+        self.assertNotIn(1, DEVICE_LOST_CODES)
+        self.assertNotIn(4, DEVICE_LOST_CODES)
+        self.assertIn("firmware", describe_code(6))
+
+    def test_connection_status_is_about_dut(self) -> None:
+        """STATUS:NOT CONNECTED z kodem 0 to sprawny tester z pustym gniazdem."""
+        client = PM125Client("dowolny.exe", "PMPD80LLAD", 1.0)
+        with patch.object(PM125Client, "_run", return_value="STATUS:NOT CONNECTED"), \
+                patch("pathlib.Path.is_file", return_value=True):
+            self.assertTrue(client.connect())
+        self.assertTrue(client.connected)
+        self.assertFalse(client._dut_in_output("STATUS:NOT CONNECTED"))
+        self.assertTrue(client._dut_in_output("STATUS:CONNECTED"))
+
+    def test_find_devices_parses_console_output(self) -> None:
+        from hardware import find_devices
+
+        with patch("pathlib.Path.is_file", return_value=True), \
+                patch("subprocess.run") as runner:
+            runner.return_value.stdout = "0=PMPD80LLAD\n1=PMPD80LN6E\n"
+            devices = find_devices("dowolny.exe")
+        self.assertEqual(devices, [(0, "PMPD80LLAD"), (1, "PMPD80LN6E")])
 
 
 if __name__ == "__main__":

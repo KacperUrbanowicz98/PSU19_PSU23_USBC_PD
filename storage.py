@@ -262,6 +262,8 @@ class AttemptStore:
         self.retention_days = retention_days
         self._lock = threading.RLock()
         self._attempts = self._load()
+        #: Numery seryjne aktualnie testowane, per kanał — tylko w pamięci procesu.
+        self._reserved: dict[str, str] = {}
 
     def reconfigure(self, path: Path, retention_days: int) -> None:
         with self._lock:
@@ -273,6 +275,28 @@ class AttemptStore:
         with self._lock:
             entry = self._attempts.get(_normalize_serial(serial_number))
             return int(entry["count"]) if entry else 0
+
+    # -- rezerwacja numeru na czas testu (ochrona przed tą samą sztuką na dwóch kanałach) --
+
+    def reserve(self, serial_number: str, station: str) -> str | None:
+        """Rezerwuje numer seryjny dla kanału. Zwraca nazwę kanału, który już go trzyma."""
+        serial = _normalize_serial(serial_number)
+        with self._lock:
+            holder = self._reserved.get(serial)
+            if holder is not None and holder != station:
+                return holder
+            self._reserved[serial] = station
+            return None
+
+    def release(self, serial_number: str, station: str) -> None:
+        serial = _normalize_serial(serial_number)
+        with self._lock:
+            if self._reserved.get(serial) == station:
+                self._reserved.pop(serial, None)
+
+    def reserved_by(self, serial_number: str) -> str | None:
+        with self._lock:
+            return self._reserved.get(_normalize_serial(serial_number))
 
     def entries(self) -> list[tuple[str, int, str]]:
         with self._lock:

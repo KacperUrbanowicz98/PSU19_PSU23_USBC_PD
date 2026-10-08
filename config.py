@@ -51,6 +51,50 @@ def _default_hrids() -> list[str]:
     ]
 
 
+@dataclass(frozen=True, slots=True)
+class StationConfig:
+    """Jeden kanał pomiarowy: nazwa widoczna dla operatora i adres testera PM125."""
+
+    name: str = "STANOWISKO"
+    #: Numer seryjny PM125 (np. PMPD80LLAD). Pusty albo "Any" = pierwsze wykryte urządzenie.
+    device_serial: str | None = None
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StationConfig":
+        known = {item for item in cls.__slots__}
+        return cls(**{key: value for key, value in data.items() if key in known})
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @property
+    def address(self) -> str:
+        return self.device_serial or "Any"
+
+
+def _default_stations() -> list[StationConfig]:
+    return [StationConfig("STANOWISKO", None, True)]
+
+
+def station_names_for(count: int) -> list[str]:
+    """Domyślne nazwy kanałów: jeden kanał bez nazwy własnej, dwa jako LEWY/PRAWY."""
+    if count <= 1:
+        return ["STANOWISKO"]
+    if count == 2:
+        return ["LEWY", "PRAWY"]
+    return [f"STANOWISKO {index}" for index in range(1, count + 1)]
+
+
+def stations_from_devices(devices: list[tuple[int, str]]) -> list[StationConfig]:
+    """Buduje listę stanowisk z wyniku komendy -f (indeks, numer seryjny)."""
+    names = station_names_for(len(devices))
+    return [
+        StationConfig(names[position], serial, True)
+        for position, (_index, serial) in enumerate(devices)
+    ]
+
+
 def password_hash(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
@@ -59,24 +103,38 @@ def password_hash(password: str) -> str:
 class AppConfig:
     # --- ścieżki i urządzenie ---
     console_path: str = r"C:\USBPDAPI\USBPDConsole.exe"
+    #: Zachowane dla zgodności ze starą konfiguracją jednokanałową — przy wczytaniu
+    #: zamieniane na pojedynczy wpis w `stations`.
     device_serial: str | None = None
     reports_directory: str = "reports"
     backup_directory: str = "backup"
     logs_directory: str = "logs"
     raw_directory: str = "raw"
+    validation_directory: str = "validation"
     attempts_file: str = "serial_attempts.json"
     pending_file: str = "pending_results.json"
     audit_file: str = "config_audit.log"
 
     # --- przebieg testu ---
     measurement_interval: float = 0.05
-    profile_settle_seconds: float = 0.5
-    load_settle_seconds: float = 0.1
-    #: Okno po zmianie profilu/obciążenia: próbki sa rejestrowane, ale NIE sa oceniane.
+    #: Pauza po przełączeniu profilu. Samo wywołanie konsoli trwa kilkaset ms, a
+    #: pierwsze próbki fazy i tak są nieoceniane, więc pauza może być krótka.
+    profile_settle_seconds: float = 0.3
+    #: Pauza po zmianie obciążenia — zastąpiona oknem próbek nieocenianych.
+    load_settle_seconds: float = 0.0
+    #: Okno po zmianie profilu/obciążenia: próbki są rejestrowane, ale NIE są oceniane.
     settling_ignore_seconds: float = 0.6
-    command_timeout: float = 5.0
+    #: Ile pierwszych próbek fazy jest zawsze nieocenianych. Zabezpiecza przy wolnej
+    #: konsoli PM125, gdy jedna próbka trwa dłużej niż całe okno czasowe.
+    settling_ignore_samples: int = 1
+    #: Szacowany czas jednego wywołania USBPDConsole.exe — używany do planowania
+    #: czasu testu i walidacji timeoutu. Rzeczywista wartość trafia do logu po teście.
+    command_overhead_seconds: float = 0.6
+    #: Odwołanie do nieobecnego testera trwa ~1,7 s, a pojedyncze komendy potrafią
+    #: skoczyć powyżej 1,2 s — stąd zapas.
+    command_timeout: float = 8.0
     test_timeout: float = 60.0
-    minimum_samples: int = 3
+    minimum_samples: int = 2
     maximum_read_errors: int = 5
 
     # --- kontrola wyrobu i operatora ---
@@ -88,6 +146,10 @@ class AppConfig:
     result_window_pass_seconds: float = 2.0
     result_window_fail_seconds: float = 8.0
 
+    # --- tryb walidacyjny (dostępny tylko z panelu inżynieryjnego) ---
+    loop_default_cycles: int = 20
+    loop_pause_seconds: float = 2.0
+
     # --- dane i logi ---
     maximum_csv_rows: int = 200_000
     raw_samples_enabled: bool = True
@@ -96,6 +158,11 @@ class AppConfig:
     log_retention_days: int = 14
     debug_logging: bool = False
 
+    #: Kontrola, czy wszystkie testery mają identyczną konfigurację (-r). Różnica
+    #: oznacza, że ta sama sztuka dostanie inny wynik zależnie od gniazda.
+    verify_station_configuration: bool = True
+
+    stations: list[StationConfig] = field(default_factory=_default_stations)
     profiles: list[TestProfile] = field(default_factory=_default_profiles)
     valid_hrids: list[str] = field(default_factory=_default_hrids)
     engineering_password_hash: str = field(default_factory=lambda: password_hash("reconext2025"))
@@ -119,6 +186,7 @@ class AppConfig:
             warnings.append(f"Nieznany klucz konfiguracji pominięty: {key}")
         data = {key: value for key, value in raw.items() if key in known}
         raw_profiles = data.pop("profiles", None)
+        raw_stations = data.pop("stations", None)
         try:
             config = cls(**data)
         except (TypeError, ValueError) as exc:
@@ -128,6 +196,15 @@ class AppConfig:
                 config.profiles = [TestProfile.from_dict(item) for item in raw_profiles]
             except (TypeError, ValueError, AttributeError) as exc:
                 raise ConfigError(f"Nieprawidłowa definicja profilu: {exc}") from exc
+        if raw_stations:
+            try:
+                config.stations = [StationConfig.from_dict(item) for item in raw_stations]
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ConfigError(f"Nieprawidłowa definicja stanowiska: {exc}") from exc
+        elif config.device_serial:
+            # Migracja konfiguracji jednokanałowej: device_serial -> jeden wpis stations.
+            config.stations = [StationConfig("STANOWISKO", config.device_serial, True)]
+            warnings.append("Konfiguracja jednokanałowa — utworzono jedno stanowisko z device_serial.")
         config.valid_hrids = sorted({str(item).strip() for item in config.valid_hrids if str(item).strip()})
         return config, warnings
 
@@ -279,6 +356,10 @@ class AppConfig:
             errors.append("Timeouty muszą być dodatnie.")
         if self.minimum_samples < 1:
             errors.append("Minimalna liczba próbek musi wynosić co najmniej 1.")
+        if self.settling_ignore_samples < 0:
+            errors.append("Liczba nieocenianych próbek nie może być ujemna.")
+        if self.command_overhead_seconds < 0:
+            errors.append("Szacowany czas komendy PM125 nie może być ujemny.")
         if self.maximum_read_errors < 1:
             errors.append("Maksymalna liczba błędów odczytu musi wynosić co najmniej 1.")
         if self.maximum_serial_attempts < 1:
@@ -291,6 +372,10 @@ class AppConfig:
             errors.append("Próg wykrycia zasilacza nie może być ujemny.")
         if self.health_check_seconds < 0:
             errors.append("Okres kontroli obecności PM125 nie może być ujemny.")
+        if not 1 <= self.loop_default_cycles <= 500:
+            errors.append("Domyślna liczba cykli walidacji musi mieścić się w zakresie 1-500.")
+        if self.loop_pause_seconds < 0:
+            errors.append("Przerwa między cyklami walidacji nie może być ujemna.")
         if self.result_window_pass_seconds <= 0 or self.result_window_fail_seconds <= 0:
             errors.append("Czasy okna wyniku muszą być dodatnie.")
         for name, value in (
@@ -303,21 +388,82 @@ class AppConfig:
         if not self.valid_hrids:
             errors.append("Lista HRID nie może być pusta.")
 
+        active = self.active_stations()
+        if not active:
+            errors.append("Wymagane jest co najmniej jedno aktywne stanowisko.")
+        if len(active) > 4:
+            errors.append("Obsługiwane są maksymalnie 4 stanowiska.")
+        names: set[str] = set()
+        addresses: set[str] = set()
+        for station in active:
+            if not station.name.strip():
+                errors.append("Stanowisko nie może mieć pustej nazwy.")
+            if station.name in names:
+                errors.append(f"Powtórzona nazwa stanowiska: {station.name}.")
+            names.add(station.name)
+            address = station.address.upper()
+            if len(active) > 1 and address == "ANY":
+                errors.append(
+                    f"{station.name}: przy wielu stanowiskach każdy tester musi mieć "
+                    "podany numer seryjny (adres „Any” wybrałby to samo urządzenie)."
+                )
+            if address in addresses and address != "ANY":
+                errors.append(f"Powtórzony numer seryjny testera: {station.device_serial}.")
+            addresses.add(address)
+
         estimated = self.estimated_test_seconds()
         if estimated >= self.test_timeout:
             errors.append(
                 f"Timeout całego testu ({self.test_timeout:g} s) jest krótszy niż przewidywany "
-                f"czas testu ({estimated:.1f} s)."
+                f"czas testu ({estimated:.1f} s przy komendzie {self.command_overhead_seconds:g} s)."
+            )
+        rated = self.estimated_samples_per_phase() - self.settling_ignore_samples
+        if self.profiles and rated < self.minimum_samples:
+            errors.append(
+                f"Przy komendzie PM125 {self.command_overhead_seconds:g} s w fazie zmieści się "
+                f"{self.estimated_samples_per_phase()} próbek, z czego ocenianych {max(0, rated)} — "
+                f"mniej niż wymagane {self.minimum_samples}. Skróć okno stabilizacji, zmniejsz "
+                "minimalną liczbę próbek albo wydłuż fazy."
             )
         return errors
 
+    def measurement_seconds(self) -> float:
+        """Suma czasów faz pomiarowych — wymaganie procesowe (2,5 s + 2,5 s na profil)."""
+        return sum(profile.no_load_seconds + profile.load_seconds for profile in self.profiles)
+
+    def command_count_estimate(self) -> int:
+        """Liczba komend sterujących na jeden test (bez odczytów pomiarowych).
+
+        Na profil: ustawienie profilu, ustawienie obciążenia, wyzerowanie po fazie.
+        Do tego pre-kontrola obecności zasilacza i końcowy powrót do 5 V / 0 mA.
+        """
+        per_profile = 3
+        extras = (1 if self.dut_precheck_enabled else 0) + 2
+        return len(self.profiles) * per_profile + extras
+
     def estimated_test_seconds(self) -> float:
-        """Szacowany czas samego testu, bez narzutu komunikacji z PM125."""
-        total = 0.0
-        for profile in self.profiles:
+        """Szacowany czas testu razem z narzutem wywołań USBPDConsole.exe."""
+        total = self.measurement_seconds()
+        for _ in self.profiles:
             total += self.profile_settle_seconds + 2 * self.load_settle_seconds
-            total += profile.no_load_seconds + profile.load_seconds
+        total += self.command_count_estimate() * self.command_overhead_seconds
         return total
+
+    def estimated_samples_per_phase(self) -> int:
+        """Ile próbek zmieści się w krótszej fazie przy zakładanym czasie komendy."""
+        if self.command_overhead_seconds <= 0 or not self.profiles:
+            return 0
+        shortest = min(
+            min(profile.no_load_seconds, profile.load_seconds) for profile in self.profiles
+        )
+        return max(1, int(shortest / self.command_overhead_seconds))
+
+    def active_stations(self) -> list[StationConfig]:
+        return [station for station in self.stations if station.enabled]
+
+    @property
+    def multi_station(self) -> bool:
+        return len(self.active_stations()) > 1
 
     def verify_engineering_password(self, password: str) -> bool:
         return password_hash(password) == self.engineering_password_hash
@@ -339,6 +485,10 @@ class AppConfig:
     @property
     def raw_path(self) -> Path:
         return resolve_path(self.raw_directory)
+
+    @property
+    def validation_path(self) -> Path:
+        return resolve_path(self.validation_directory)
 
     @property
     def attempts_path(self) -> Path:
