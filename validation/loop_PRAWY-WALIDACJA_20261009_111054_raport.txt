@@ -1,0 +1,80 @@
+==============================================================================
+  RAPORT WALIDACYJNY STANOWISKA — PSU19 Tester 5.0.0
+==============================================================================
+Próbka:            PRAWY-WALIDACJA
+Operator (HRID):   12101333
+Start / koniec:    2026-10-09 11:03:03 — 2026-10-09 11:10:54
+Cykle:             20 z 20
+
+Wyniki:            PASS 0 · FAIL 13 · ERROR 7   (yield 0.0 %)
+Czas cyklu:        średnio 28.6 s  (min 19.2 s, max 30.2 s)
+Komenda PM125:     średnio 612 ms
+
+POWTARZALNOŚĆ STANOWISKA
+------------------------------------------------------------------------------
+  NIE — 7 cykli zakończyło się błędem stanowiska. Stanowisko nie jest gotowe do produkcji.
+
+NAPIĘCIE — margines do granic kryteriów
+------------------------------------------------------------------------------
+Profil  Faza              min [V]  max [V]   śr [V]   σ [mV]  zapas [mV]  zapas [%]
+5V      bez obciążenia      5.135    5.165    5.151      7.4         335       44.7
+5V      z obciążeniem       4.705    4.785    4.751     22.4         -45       -6.0
+9V      bez obciążenia      8.988    9.024    9.003      7.8         426       47.3
+9V      z obciążeniem       8.527    8.613    8.580     23.4         -23       -2.6
+12V     bez obciążenia     11.975   12.006   11.996      7.0         575       47.9
+12V     z obciążeniem      11.521   11.607   11.574     22.4         121       10.1
+15V     bez obciążenia     15.049   15.080   15.066      7.9         670       44.7
+15V     z obciążeniem      14.650   14.699   14.671     11.2         400       26.7
+
+  zapas = odległość najgorszego pomiaru serii od bliższej granicy kryterium
+  zapas [%] = zapas odniesiony do szerokości okna kryterium
+
+  Najciaśniej: 5V z obciążeniem — zapas -45 mV (-6.0 %), granice 4.75–5.50 V
+  UWAGA: zapas poniżej 5 % szerokości okna — przy rozrzucie produkcyjnym należy się spodziewać fałszywych odrzutów.
+
+DRYF W SERII (trend napięcia między cyklami)
+------------------------------------------------------------------------------
+  5V     z obciążeniem    -3.33 mV/cykl  (łącznie -63 mV w serii)
+  9V     bez obciążenia   -1.12 mV/cykl  (łącznie -21 mV w serii)
+  9V     z obciążeniem    -3.99 mV/cykl  (łącznie -76 mV w serii)
+  12V    z obciążeniem    -3.38 mV/cykl  (łącznie -64 mV w serii)
+  15V    z obciążeniem    +1.15 mV/cykl  (łącznie +22 mV w serii)
+
+  Systematyczny dryf zwykle oznacza nagrzewanie się zasilacza lub obciążenia.
+
+PRĄD POD OBCIĄŻENIEM — czy obciążenie trzyma nastawę
+------------------------------------------------------------------------------
+Profil     min [A]   max [A]    śr [A]    σ [mA]       granice [A]
+5V           2.997     3.004     3.000       1.7     2.40–3.60    
+9V           2.996     3.009     3.001       2.2     2.40–3.60    
+12V          2.994     3.009     3.000       2.9     2.40–3.60    
+15V          2.395     2.406     2.400       3.1     1.92–2.88    
+
+ZDARZENIA W SERII
+------------------------------------------------------------------------------
+  cykl 1: FAIL — 5V z obciążeniem: napięcie 4.742 V poza zakresem 4.75-5.50 V
+  cykl 2: FAIL — 5V z obciążeniem: napięcie 4.748 V poza zakresem 4.75-5.50 V
+  cykl 3: FAIL — 5V z obciążeniem: napięcie 4.748 V poza zakresem 4.75-5.50 V
+  cykl 4: FAIL — 5V z obciążeniem: napięcie 4.748 V poza zakresem 4.75-5.50 V
+  cykl 5: FAIL — 5V z obciążeniem: napięcie 4.748 V poza zakresem 4.75-5.50 V
+  cykl 6: FAIL — 5V z obciążeniem: napięcie 4.748 V poza zakresem 4.75-5.50 V
+  cykl 7: FAIL — 5V z obciążeniem: napięcie 4.736 V poza zakresem 4.75-5.50 V
+  cykl 8: FAIL — 5V z obciążeniem: napięcie 4.742 V poza zakresem 4.75-5.50 V
+  cykl 9: FAIL — 5V z obciążeniem: napięcie 4.742 V poza zakresem 4.75-5.50 V
+  cykl 10: FAIL — 5V z obciążeniem: napięcie 4.730 V poza zakresem 4.75-5.50 V
+  cykl 11: FAIL — 5V z obciążeniem: napięcie 4.717 V poza zakresem 4.75-5.50 V
+  cykl 12: FAIL — 5V z obciążeniem: napięcie 4.736 V poza zakresem 4.75-5.50 V
+  cykl 13: FAIL — 5V z obciążeniem: napięcie 4.730 V poza zakresem 4.75-5.50 V
+  cykl 14: ERROR — USBPDConsole: nie udało się połączyć z testerem (kod 3) — Error: Device not found.; Nie udało się przywrócić 5 V / 0 mA.
+  cykl 15: PM125 nie jest połączony.
+  cykl 16: PM125 nie jest połączony.
+  cykl 17: PM125 nie jest połączony.
+  cykl 18: PM125 nie jest połączony.
+  cykl 19: PM125 nie jest połączony.
+  cykl 20: PM125 nie jest połączony.
+
+WNIOSEK
+------------------------------------------------------------------------------
+  Stanowisko NIEGOTOWE: 7 z 20 cykli zakończyło się błędem stanowiska. Usuń przyczynę przed wdrożeniem.
+
+Seria walidacyjna nie trafia do raportu produkcyjnego i nie zużywa licznika prób.

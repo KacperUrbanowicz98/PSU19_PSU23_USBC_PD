@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from config import AppConfig, ConfigError, StationConfig, station_names_for, stations_from_devices
+from detection import plan_station_remap
 from engine import TestEngine
 from hardware import PM125Client, SimulatedPM125
 from models import (
@@ -761,6 +762,70 @@ class DetectedStationTests(unittest.TestCase):
         self.assertTrue(config.multi_station)
 
 
+class RemapTests(unittest.TestCase):
+    """Przypisanie wykrytych testerów do istniejących gniazd (przycisk WYKRYJ TESTERY)."""
+
+    @staticmethod
+    def _two_stations() -> list[StationConfig]:
+        return [StationConfig("LEWY", "AAA"), StationConfig("PRAWY", "BBB")]
+
+    def test_matching_serials_give_no_changes(self) -> None:
+        plan = plan_station_remap(self._two_stations(), [(0, "AAA"), (1, "BBB")])
+        self.assertFalse(plan.has_changes)
+        self.assertEqual(plan.unchanged, ["LEWY", "PRAWY"])
+        self.assertEqual(plan.missing, [])
+
+    def test_changed_serial_is_remapped_keeping_names(self) -> None:
+        """Przypadek z produkcji: prawy tester zgłosił się pod innym numerem."""
+        plan = plan_station_remap(self._two_stations(), [(0, "AAA"), (1, "CCC")])
+        self.assertEqual([item.name for item in plan.stations], ["LEWY", "PRAWY"])
+        self.assertEqual([item.device_serial for item in plan.stations], ["AAA", "CCC"])
+        self.assertEqual(plan.unchanged, ["LEWY"])
+        self.assertEqual(len(plan.changes), 1)
+        self.assertFalse(plan.requires_restart)
+
+    def test_order_of_detection_does_not_steal_matched_serial(self) -> None:
+        """Dopasowanie istniejących numerów idzie przed przypisaniem wolnych."""
+        plan = plan_station_remap(self._two_stations(), [(0, "CCC"), (1, "BBB")])
+        self.assertEqual([item.device_serial for item in plan.stations], ["CCC", "BBB"])
+        self.assertEqual(plan.unchanged, ["PRAWY"])
+
+    def test_missing_station_is_reported_not_silently_dropped(self) -> None:
+        plan = plan_station_remap(self._two_stations(), [(0, "AAA")])
+        self.assertEqual(plan.missing, ["PRAWY"])
+        self.assertEqual(len(plan.stations), 2)
+        self.assertFalse(plan.has_changes)
+
+    def test_extra_tester_adds_station_and_needs_restart(self) -> None:
+        plan = plan_station_remap([StationConfig("STANOWISKO", "AAA")], [(0, "AAA"), (1, "BBB")])
+        self.assertEqual(len(plan.stations), 2)
+        self.assertTrue(plan.requires_restart)
+        self.assertEqual(plan.added, ["PRAWY"])
+
+    def test_single_station_with_any_address_takes_detected_serial(self) -> None:
+        plan = plan_station_remap([StationConfig("STANOWISKO", None)], [(0, "AAA")])
+        self.assertEqual(plan.stations[0].device_serial, "AAA")
+        self.assertTrue(plan.has_changes)
+
+    def test_disabled_station_is_passed_through(self) -> None:
+        stations = [StationConfig("LEWY", "AAA"), StationConfig("ZAPAS", "ZZZ", False)]
+        plan = plan_station_remap(stations, [(0, "CCC")])
+        self.assertEqual(plan.stations[0].device_serial, "CCC")
+        self.assertEqual(plan.stations[1], stations[1])
+
+    def test_result_is_a_valid_configuration(self) -> None:
+        config = AppConfig()
+        config.stations = self._two_stations()
+        plan = plan_station_remap(config.stations, [(0, "DDD"), (1, "EEE")])
+        config.stations = plan.stations
+        self.assertEqual(config.validate(), [])
+
+    def test_duplicate_detection_entries_are_ignored(self) -> None:
+        plan = plan_station_remap(self._two_stations(), [(0, "AAA"), (1, "AAA")])
+        self.assertEqual(plan.missing, ["PRAWY"])
+        self.assertEqual(plan.stations[0].device_serial, "AAA")
+
+
 class ReturnCodeTests(unittest.TestCase):
     def test_device_lost_codes(self) -> None:
         from hardware import DEVICE_LOST_CODES, describe_code
@@ -789,6 +854,108 @@ class ReturnCodeTests(unittest.TestCase):
             runner.return_value.stdout = "0=PMPD80LLAD\n1=PMPD80LN6E\n"
             devices = find_devices("dowolny.exe")
         self.assertEqual(devices, [(0, "PMPD80LLAD"), (1, "PMPD80LN6E")])
+
+
+def _tk_available() -> bool:
+    """Testy okien mają sens tylko tam, gdzie jest Tkinter i pulpit (stacja z Pythonem)."""
+    try:
+        import tkinter
+
+        root = tkinter.Tk()
+    except Exception:
+        return False
+    root.destroy()
+    return True
+
+
+TK_AVAILABLE = _tk_available()
+
+
+@unittest.skipUnless(TK_AVAILABLE, "brak Tkinter albo pulpitu")
+class GuiSmokeTests(unittest.TestCase):
+    """Budowa okien. Łapie literówki w konstruktorach, których logika sama nie wykryje."""
+
+    def setUp(self) -> None:
+        import tkinter as tk
+
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        base = Path(self.folder.name)
+        self.config = AppConfig()
+        for attribute, name in (
+            ("reports_directory", "reports"), ("backup_directory", "backup"),
+            ("logs_directory", "logs"), ("raw_directory", "raw"),
+            ("validation_directory", "validation"),
+        ):
+            setattr(self.config, attribute, str(base / name))
+        self.config.attempts_file = str(base / "attempts.json")
+        self.config.pending_file = str(base / "pending.json")
+        self.config.audit_file = str(base / "audit.log")
+        self.config.health_check_seconds = 0
+        self.config_path = base / "config.json"
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self._destroy_root)
+
+    def _destroy_root(self) -> None:
+        import tkinter as tk
+
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _two_station_app(self):
+        import ui
+
+        self.config.stations = [
+            StationConfig("LEWY", "AAA"), StationConfig("PRAWY", "BBB")
+        ]
+        self.config.save(self.config_path)
+        hardware = ui.build_hardware(self.config, True, "pass", 0.0)
+        app = ui.TesterApp(
+            self.root, self.config, hardware, self.config_path, simulation_mode=True
+        )
+        self.root.update()
+        return app
+
+    def test_loop_window_builds(self) -> None:
+        """Regresja: okno serii odwoływało się do nieistniejącej nazwy i nie otwierało się."""
+        from loop_ui import LoopWindow
+
+        window = LoopWindow(
+            self.root, self.config, TestEngine(self.config, SimulatedPM125("pass")),
+            None, "TEST", on_state_change=lambda _running: None, station_name="LEWY",
+        )
+        self.root.update()
+        self.assertTrue(window.exists())
+        window.window.destroy()
+
+    def test_loop_windows_open_for_every_station(self) -> None:
+        app = self._two_station_app()
+        app._open_loop_window()
+        self.root.update()
+        self.assertIsNotNone(app._loop_chooser)
+        app._launch_all_loops()
+        self.root.update()
+        self.assertEqual(sorted(app._loop_windows), ["LEWY", "PRAWY"])
+        self.assertTrue(all(window.exists() for window in app._loop_windows.values()))
+
+    def test_validation_blocks_only_its_own_station(self) -> None:
+        """Wymaganie: seria na jednym gnieździe nie może zatrzymywać produkcji na drugim."""
+        app = self._two_station_app()
+        app.operator_hrid = "TEST"
+        app._loop_state_changed("LEWY", True)
+        self.root.update()
+        self.assertTrue(app.panels[0].loop_active)
+        self.assertFalse(app.panels[1].loop_active)
+        self.assertFalse(app.blocked)
+        app._loop_state_changed("LEWY", False)
+        self.assertFalse(app.panels[0].loop_active)
+
+    def test_detect_button_exists_in_operator_bar(self) -> None:
+        app = self._two_station_app()
+        self.assertEqual(app.detect_button.cget("text"), "WYKRYJ TESTERY")
 
 
 if __name__ == "__main__":

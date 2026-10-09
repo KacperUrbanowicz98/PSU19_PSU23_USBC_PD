@@ -16,8 +16,9 @@ from collections import deque
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
-from config import AppConfig, StationConfig
-from hardware import Hardware, PM125Client, SimulatedPM125
+from config import AppConfig, ConfigError, StationConfig
+from detection import StationRemapPlan, plan_station_remap
+from hardware import Hardware, PM125Client, SimulatedPM125, find_devices
 from logging_utils import configure_logging
 from loop_ui import LoopWindow
 from models import FinalStatus, TestResult
@@ -64,8 +65,11 @@ class TesterApp:
         self.history: deque[tuple[str, str, str, str, float]] = deque(maxlen=4)
         self._engineering_presses: list[float] = []
         self._settings_dialog: SettingsDialog | None = None
-        self._loop_window: LoopWindow | None = None
-        self._loop_running = False
+        #: Serie walidacyjne: po jednym oknie na stanowisko, mogą biec równolegle.
+        self._loop_windows: dict[str, LoopWindow] = {}
+        self._loops_running: set[str] = set()
+        self._loop_chooser: tk.Toplevel | None = None
+        self._detecting = False
 
         devices = hardware if isinstance(hardware, list) else [hardware]
         stations = config.active_stations()
@@ -90,16 +94,24 @@ class TesterApp:
         return self.operator_hrid is not None
 
     @property
+    def _loop_running(self) -> bool:
+        """Czy gdziekolwiek trwa seria walidacyjna."""
+        return bool(self._loops_running)
+
+    @property
     def blocked(self) -> bool:
-        return bool(self.pending.count) or self._loop_running
+        """Blokada wspólna dla wszystkich gniazd. Seria walidacyjna blokuje tylko swoje."""
+        return bool(self.pending.count)
 
     @property
     def blocked_reason(self) -> str:
-        if self._loop_running:
-            return "Trwa seria walidacyjna — testy produkcyjne są zablokowane."
         if self.pending.count:
             return "Niezapisany wynik. Użyj „Ponów zapis”."
         return ""
+
+    def loop_active(self, station_name: str) -> bool:
+        """Seria walidacyjna zajmuje wyłącznie swoje gniazdo — drugie pracuje dalej."""
+        return station_name in self._loops_running
 
     def post(self, event: tuple) -> None:
         """Wątki robocze paneli oddają zdarzenia do wątku GUI przez tę kolejkę."""
@@ -293,6 +305,12 @@ class TesterApp:
         )
         self.logout_button.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.detect_button = self._button(
+            content, "WYKRYJ TESTERY", self.detect_testers,
+            COLORS["warning"], COLORS["warning_hover"], padx=16, pady=7,
+        )
+        self.detect_button.pack(side=tk.LEFT, padx=(16, 0))
+
         self.station_hint = tk.Label(
             content, text="", bg=COLORS["card"], fg=COLORS["muted"], font=("Segoe UI", 9)
         )
@@ -414,10 +432,13 @@ class TesterApp:
                 text="Operator niezalogowany", bg=COLORS["primary_soft"], fg=COLORS["primary"]
             )
         if len(self.panels) > 1:
+            parts: list[str] = []
             running = [panel.station.name for panel in self.panels if panel.busy]
-            self.station_hint.config(
-                text=("Test w toku: " + ", ".join(running)) if running else "Oba gniazda wolne"
-            )
+            if running:
+                parts.append("Test w toku: " + ", ".join(running))
+            if self._loops_running:
+                parts.append("Walidacja: " + ", ".join(sorted(self._loops_running)))
+            self.station_hint.config(text="   ·   ".join(parts) if parts else "Oba gniazda wolne")
 
     # ---------------------------------------------------------------- sprzęt
 
@@ -441,10 +462,134 @@ class TesterApp:
     def _health_check(self) -> None:
         if self.closing:
             return
-        if not self._loop_running:
-            for panel in self.panels:
+        for panel in self.panels:
+            # Kontrola obecności to dodatkowa komenda — nie wchodzimy w drogę serii
+            # walidacyjnej na tym gnieździe, ale pozostałe sprawdzamy normalnie.
+            if not self.loop_active(panel.station.name):
                 panel.health_check()
         self._schedule_health_check()
+
+    # ------------------------------------------------- wykrywanie testerów
+
+    def detect_testers(self) -> None:
+        """Przypina gniazda do faktycznie widocznych testerów (komenda -f).
+
+        Dostępne dla operatora, bo numer seryjny testera potrafi się zmienić
+        (wymiana sztuki, inne gniazdo USB) i wtedy kanał nie startuje. Nie zmienia
+        żadnych kryteriów ani czasów — wyłącznie przypisanie tester → stanowisko.
+        """
+        if self._detecting:
+            return
+        if any(panel.busy for panel in self.panels) or self._loop_running:
+            messagebox.showwarning(
+                "Wykrywanie testerów", "Poczekaj na zakończenie trwających testów."
+            )
+            return
+        if self.simulation_mode:
+            messagebox.showinfo(
+                "Wykrywanie testerów", "Tryb symulatora — brak fizycznych testerów do wykrycia."
+            )
+            return
+
+        self._detecting = True
+        self._sync_all()
+        console_path = self.config.console_path
+
+        def worker() -> None:
+            try:
+                devices = find_devices(console_path)
+                self.post(("detected", devices, ""))
+            except Exception as exc:  # find_devices sam loguje, ale GUI musi odmrozić
+                logger.exception("Błąd wykrywania testerów")
+                self.post(("detected", [], str(exc)))
+
+        threading.Thread(target=worker, daemon=True, name="detect-testers").start()
+
+    def _handle_detected(self, devices: list[tuple[int, str]], error: str) -> None:
+        self._detecting = False
+        self._sync_all()
+        if error:
+            messagebox.showerror(
+                "Wykrywanie testerów",
+                f"Nie udało się odpytać konsoli PM125.\n\n{error}\n\n"
+                "Sprawdź ścieżkę do USBPDConsole.exe w panelu inżynieryjnym.",
+            )
+            return
+        if not devices:
+            messagebox.showerror(
+                "Wykrywanie testerów",
+                "Konsola PM125 nie widzi żadnego testera.\n\n"
+                "Sprawdź kable USB i zasilanie testerów, a potem spróbuj ponownie.",
+            )
+            return
+
+        logger.info("Wykryto testery: %s", ", ".join(serial for _index, serial in devices))
+        plan = plan_station_remap(self.config.stations, devices)
+        listing = ", ".join(serial for _index, serial in devices)
+
+        if not plan.has_changes:
+            message = f"Wykryte testery: {listing}\n\nPrzypisanie gniazd jest poprawne."
+            if plan.missing:
+                message += "\n\nBrak testera dla: " + ", ".join(plan.missing) + "."
+            messagebox.showinfo("Wykrywanie testerów", message)
+            self._connect_all()
+            return
+
+        confirm = (
+            f"Wykryte testery: {listing}\n\n{plan.summary()}\n\nZastosować nowe przypisanie?"
+        )
+        if plan.requires_restart:
+            confirm += (
+                "\n\nUwaga: dołożenie gniazda zmienia układ okna — po zapisie "
+                "trzeba uruchomić aplikację ponownie."
+            )
+        if not messagebox.askyesno("Wykrywanie testerów", confirm):
+            logger.info("Operator odrzucił propozycję przypisania testerów.")
+            return
+        self._apply_remap(plan)
+
+    def _apply_remap(self, plan: StationRemapPlan) -> None:
+        previous = list(self.config.stations)
+        self.config.stations = list(plan.stations)
+        errors = self.config.validate()
+        if errors:
+            self.config.stations = previous
+            logger.error("Odrzucono przypisanie testerów: %s", "; ".join(errors))
+            messagebox.showerror(
+                "Wykrywanie testerów",
+                "Nowe przypisanie jest nieprawidłowe:\n- " + "\n- ".join(errors),
+            )
+            return
+
+        saved = True
+        try:
+            self.config.save(
+                self.config_path,
+                audit_note=(
+                    f"wykrywanie testerów (operator={self.operator_hrid or '-'}): "
+                    + "; ".join(plan.changes)
+                ),
+            )
+        except ConfigError as exc:
+            saved = False
+            logger.error("Nie zapisano przypisania testerów: %s", exc)
+
+        active = self.config.active_stations()
+        for panel, station in zip(self.panels, active):
+            panel.rebind(station, self.config)
+        logger.info("Zastosowano przypisanie testerów: %s", "; ".join(plan.changes))
+        self._sync_all()
+        self._connect_all()
+
+        message = "Zastosowano nowe przypisanie testerów:\n\n" + plan.summary()
+        if not saved:
+            message += (
+                "\n\nUstawienie działa w tej sesji, ale nie udało się zapisać pliku "
+                "konfiguracji — po restarcie trzeba je powtórzyć."
+            )
+        if len(active) != len(self.panels):
+            message += "\n\nLiczba gniazd się zmieniła — uruchom aplikację ponownie."
+        messagebox.showinfo("Wykrywanie testerów", message)
 
     def _verify_station_configuration(self) -> None:
         """Porównuje konfigurację testerów (-r). Różnica = inny wynik zależnie od gniazda."""
@@ -509,6 +654,8 @@ class TesterApp:
                         self._handle_save_done(event[1], event[2])
                     elif kind == "station_config":
                         self._handle_station_config(event[1])
+                    elif kind == "detected":
+                        self._handle_detected(event[1], event[2])
                 except Exception:
                     logger.exception("Błąd obsługi zdarzenia %s", kind)
         except queue.Empty:
@@ -590,6 +737,10 @@ class TesterApp:
         self.hrid_entry.config(state=tk.DISABLED if logged else tk.NORMAL)
         self.login_button.config(state=tk.DISABLED if logged else tk.NORMAL)
         self.logout_button.config(state=tk.NORMAL if logged and not busy else tk.DISABLED)
+        self.detect_button.config(
+            state=tk.DISABLED if (busy or self._detecting or self._loop_running) else tk.NORMAL,
+            text="WYKRYWANIE..." if self._detecting else "WYKRYJ TESTERY",
+        )
         self._update_operator_state()
         for panel in self.panels:
             panel.sync_controls()
@@ -633,55 +784,133 @@ class TesterApp:
         )
 
     def _open_loop_window(self) -> None:
-        """Tryb walidacyjny — wyłącznie z panelu inżynieryjnego, czyli po haśle."""
-        if self._loop_window is not None and self._loop_window.exists():
-            self._loop_window.focus()
-            return
-        if any(panel.busy for panel in self.panels):
-            messagebox.showwarning("Tryb walidacyjny", "Trwa test zasilacza.")
-            return
-        panel = self._choose_loop_panel()
-        if panel is None:
-            return
+        """Tryb walidacyjny — wyłącznie z panelu inżynieryjnego, czyli po haśle.
+
+        Każde stanowisko dostaje własne okno serii. Serie mogą biec równolegle na
+        wszystkich testerach; seria zajmuje tylko swoje gniazdo.
+        """
         self._settings_dialog = None
-        self._loop_window = LoopWindow(
+        if len(self.panels) == 1:
+            self._launch_loop(self.panels[0])
+            return
+        self._show_loop_chooser()
+
+    def _show_loop_chooser(self) -> None:
+        """Wybór stanowiska dla serii — z możliwością uruchomienia wszystkich naraz."""
+        if self._loop_chooser is not None and self._loop_chooser.winfo_exists():
+            self._loop_chooser.lift()
+            self._loop_chooser.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._loop_chooser = window
+        window.title("Tryb walidacyjny — wybór stanowiska")
+        window.configure(bg=COLORS["background"])
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self._close_loop_chooser)
+
+        tk.Label(
+            window, text="Na którym stanowisku uruchomić serię?", bg=COLORS["background"],
+            fg=COLORS["text"], font=("Segoe UI", 12, "bold"),
+        ).pack(padx=24, pady=(20, 4))
+        tk.Label(
+            window,
+            text="Serie mogą biec równolegle. Seria zajmuje tylko swoje gniazdo —\n"
+                 "na pozostałych produkcja idzie dalej.",
+            bg=COLORS["background"], fg=COLORS["muted"], font=("Segoe UI", 9), justify=tk.LEFT,
+        ).pack(padx=24, pady=(0, 14))
+
+        row = tk.Frame(window, bg=COLORS["background"])
+        row.pack(padx=24, pady=(0, 10))
+        for panel in self.panels:
+            open_already = panel.station.name in self._loop_windows
+            button = self._button(
+                row, panel.station.name,
+                lambda target=panel: self._launch_loop(target),
+                COLORS["primary"], COLORS["primary_hover"], font_size=10, padx=24, pady=10,
+            )
+            button.pack(side=tk.LEFT, padx=5)
+            if open_already:
+                button.config(text=f"{panel.station.name} (otwarte)")
+
+        self._button(
+            window, "WSZYSTKIE STANOWISKA NARAZ", self._launch_all_loops,
+            COLORS["warning"], COLORS["warning_hover"], font_size=10, padx=22, pady=10,
+        ).pack(padx=24, pady=(0, 8))
+        self._button(
+            window, "Anuluj", self._close_loop_chooser, COLORS["card"], COLORS["primary_soft"],
+            foreground=COLORS["primary"], active_foreground=COLORS["primary"], padx=20, pady=7,
+        ).pack(padx=24, pady=(0, 18))
+
+        window.update_idletasks()
+        screen_width = window.winfo_screenwidth()
+        screen_height = window.winfo_screenheight()
+        x = max(0, (screen_width - window.winfo_width()) // 2)
+        y = max(0, (screen_height - window.winfo_height()) // 3)
+        window.geometry(f"+{x}+{y}")
+
+    def _close_loop_chooser(self) -> None:
+        if self._loop_chooser is not None:
+            try:
+                if self._loop_chooser.winfo_exists():
+                    self._loop_chooser.destroy()
+            except tk.TclError:
+                pass
+            self._loop_chooser = None
+
+    def _launch_all_loops(self) -> None:
+        opened = [panel for panel in self.panels if self._launch_loop(panel, keep_chooser=True)]
+        self._close_loop_chooser()
+        if not opened:
+            return
+        logger.info(
+            "Tryb walidacyjny: otwarto okna serii dla stanowisk %s",
+            ", ".join(panel.station.name for panel in opened),
+        )
+
+    def _launch_loop(self, panel: StationPanel, keep_chooser: bool = False) -> bool:
+        """Otwiera okno serii dla jednego gniazda. Zwraca True, gdy okno jest dostępne."""
+        existing = self._loop_windows.get(panel.station.name)
+        if existing is not None and existing.exists():
+            existing.focus()
+            if not keep_chooser:
+                self._close_loop_chooser()
+            return True
+        if panel.busy:
+            messagebox.showwarning(
+                "Tryb walidacyjny",
+                f"Na stanowisku {panel.station.name} trwa test zasilacza.",
+            )
+            return False
+
+        name = panel.station.name
+        self._loop_windows[name] = LoopWindow(
             self.root,
             self.config,
             panel.engine,
             self.raw_writer,
             self.operator_hrid,
-            on_state_change=self._loop_state_changed,
-            on_closed=self._loop_closed,
-            station_name=panel.station.name,
+            on_state_change=lambda running, station=name: self._loop_state_changed(station, running),
+            on_closed=lambda station=name: self._loop_closed(station),
+            station_name=name,
+            window_offset=len(self._loop_windows),
+            station_busy=lambda target=panel: target.busy,
         )
+        if not keep_chooser:
+            self._close_loop_chooser()
+        self._sync_all()
+        return True
+
+    def _loop_state_changed(self, station_name: str, running: bool) -> None:
+        if running:
+            self._loops_running.add(station_name)
+        else:
+            self._loops_running.discard(station_name)
         self._sync_all()
 
-    def _choose_loop_panel(self) -> StationPanel | None:
-        if len(self.panels) == 1:
-            return self.panels[0]
-        names = [panel.station.name for panel in self.panels]
-        answer = simpledialog.askstring(
-            "Tryb walidacyjny",
-            "Na którym stanowisku uruchomić serię?\n\nDostępne: " + ", ".join(names),
-            initialvalue=names[0],
-            parent=self.root,
-        )
-        if answer is None:
-            return None
-        chosen = answer.strip().upper()
-        for panel in self.panels:
-            if panel.station.name.upper() == chosen:
-                return panel
-        messagebox.showwarning("Tryb walidacyjny", f"Nie ma stanowiska o nazwie „{answer}”.")
-        return None
-
-    def _loop_state_changed(self, running: bool) -> None:
-        self._loop_running = running
-        self._sync_all()
-
-    def _loop_closed(self) -> None:
-        self._loop_window = None
-        self._loop_running = False
+    def _loop_closed(self, station_name: str) -> None:
+        self._loop_windows.pop(station_name, None)
+        self._loops_running.discard(station_name)
         self._sync_all()
 
     def _apply_new_config(self, new_config: AppConfig) -> None:
@@ -715,8 +944,11 @@ class TesterApp:
             f"Trwa test na stanowisku: {', '.join(busy)}. Zamknąć aplikację i anulować?",
         ):
             return
-        if self._loop_running and not messagebox.askyesno(
-            "PSU19 Tester", "Trwa seria walidacyjna. Przerwać ją i zamknąć aplikację?"
+        if self._loops_running and not messagebox.askyesno(
+            "PSU19 Tester",
+            "Trwa seria walidacyjna na stanowisku: "
+            + ", ".join(sorted(self._loops_running))
+            + ". Przerwać ją i zamknąć aplikację?",
         ):
             return
         if self.pending.count and not messagebox.askyesno(
@@ -730,8 +962,9 @@ class TesterApp:
         self.closing = True
         for panel in self.panels:
             panel.shutdown()
-        if self._loop_window is not None and self._loop_window.exists():
-            self._loop_window.cancel_event.set()
+        for window in list(self._loop_windows.values()):
+            if window.exists():
+                window.cancel_event.set()
 
         def worker() -> None:
             for panel in self.panels:

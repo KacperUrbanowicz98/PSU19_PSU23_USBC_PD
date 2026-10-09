@@ -1,4 +1,4 @@
-# PSU19 Tester v5.0 — test zasilaczy USB-C PD na PM125
+# PSU19 Tester v5.2 — test zasilaczy USB-C PD na PM125
 
 Aplikacja stanowiskowa do testu zasilaczy USB Power Delivery (SR213 PSU / SPBV36UK-W / SPBV36EU-W)
 przy użyciu testera PassMark PM125 i konsoli `USBPDConsole.exe`.
@@ -21,8 +21,9 @@ loop_ui.py            okno trybu walidacyjnego
 theme.py              paleta kolorów
 ui.py                 okno główne: operator, kanały, statystyki
 station_panel.py      panel jednego kanału pomiarowego
+detection.py          dopasowanie wykrytych testerów do gniazd
 settings_ui.py        panel inżynieryjny
-selftest.py           testy automatyczne (59 testów)
+selftest.py           testy automatyczne (74 testy, w tym testy okien)
 build_exe.py          budowanie EXE
 test_config.json      konfiguracja stanowiska
 run_app.bat / run_simulator.bat / run_tests.bat / build_exe.bat
@@ -97,6 +98,40 @@ przycisk **UŻYJ WYKRYTYCH** (tworzy listę kanałów z podłączonych testerów
 dodawać i edytować ręcznie — nazwa i numer seryjny.
 
 **Ręcznie w pliku:** wpisz listę `stations` jak wyżej w `test_config.json`.
+
+### Przycisk WYKRYJ TESTERY (bez hasła, dla operatora)
+
+Obok **Zaloguj / Wyloguj** jest przycisk **WYKRYJ TESTERY**. Rozwiązuje najczęstszy powód
+wzywania inżyniera: tester jest podłączony, ale zgłasza się pod innym numerem seryjnym niż
+zapisany w konfiguracji (wymiana sztuki, inne gniazdo USB, przeinstalowany sterownik), więc
+kanał pokazuje **BRAK TESTERA** i nie da się na nim testować.
+
+Co robi przycisk:
+
+1. odpytuje konsolę (`USBPDConsole.exe -f`) o faktycznie widoczne testery,
+2. zostawia bez zmian gniazda, których numer seryjny się zgadza,
+3. pozostałym gniazdom przypisuje wolne numery seryjne — **zachowując nazwy i kolejność
+   kanałów** (LEWY zostaje LEWY),
+4. pokazuje, co dokładnie zmieni, i czeka na potwierdzenie,
+5. po potwierdzeniu zapisuje konfigurację, dopisuje wpis do dziennika audytu
+   (`config_audit.log`, razem z numerem HRID operatora) i od razu łączy się z testerami —
+   **bez restartu aplikacji**.
+
+Czego przycisk **nie** zmienia: kryteriów, czasów faz, profili, listy HRID ani hasła
+inżynieryjnego. Wyłącznie przypisanie tester → gniazdo.
+
+Sytuacje brzegowe:
+
+| Sytuacja | Zachowanie |
+|---|---|
+| Konsola nie widzi żadnego testera | komunikat o braku urządzeń, nic nie jest zmieniane |
+| Wykryto mniej testerów niż gniazd | gniazdo bez testera zostaje nietknięte i jest wymienione w komunikacie |
+| Wykryto więcej testerów niż gniazd | proponuje dołożenie kanału; to zmienia układ okna, więc wymaga restartu |
+| Trwa test albo seria walidacyjna | przycisk jest nieaktywny |
+| Tryb symulatora | komunikat, że nie ma czego wykrywać |
+
+Jeżeli po wykryciu gniazdo nadal pokazuje **BRAK TESTERA**, problem jest fizyczny (kabel,
+zasilanie, sterownik) — wtedy dopiero warto wołać utrzymanie ruchu.
 
 Numery seryjne testerów odczytasz komendą `USBPDConsole.exe -f` (odpowiedź w postaci
 `0=PMPD80LLAD`) albo przyciskiem **WYKRYJ TESTERY** w panelu. Przy dwóch kanałach numer
@@ -258,18 +293,41 @@ leżą rzeczywiste pomiary).
 Dostęp: panel inżynieryjny → przycisk **TRYB WALIDACYJNY (LOOP)**, czyli wyłącznie po haśle
 inżynieryjnym. Operator nie ma jak tam trafić z ekranu produkcyjnego.
 
-Zasady:
+### Seria na każdym testerze, także na obu naraz
+
+Przy jednym gnieździe okno serii otwiera się od razu. Przy dwóch pojawia się wybór:
+**LEWY**, **PRAWY** albo **WSZYSTKIE STANOWISKA NARAZ**.
+
+Każde gniazdo dostaje **własne okno serii** z własnymi parametrami, własnym przebiegiem
+i własnym raportem. Serie mogą biec **równolegle na wszystkich testerach** — testery pracują
+niezależnie (zmierzony współczynnik równoległości 0,52), więc walidacja dwóch gniazd trwa
+tyle, co walidacja jednego.
+
+Blokady są **wyłącznie na poziomie gniazda**:
+
+- seria na LEWYM blokuje produkcję na LEWYM, a PRAWY testuje dalej normalnie,
+- panel gniazda w trakcie serii pokazuje **WALIDACJA** zamiast GOTOWE,
+- test produkcyjny i seria na tym samym gnieździe nie mogą iść naraz — dzielą jednego
+  klienta PM125, więc próba uruchomienia serii w trakcie testu kończy się komunikatem,
+- kontrola obecności testera (`health check`) pomija gniazdo z serią, żeby nie wtrącać
+  dodatkowych komend w pomiar; pozostałe gniazda sprawdza normalnie.
+
+Nazwa stanowiska trafia do nazwy plików raportu (`loop_LEWY-WALIDACJA_...`), więc serie
+z obu gniazd nie mieszają się ze sobą.
+
+Pozostałe zasady:
 
 - seria **nie zapisuje się do raportu produkcyjnego** — dane idą do `validation/`,
 - seria **nie zużywa licznika prób** żadnego numeru seryjnego,
-- na czas serii testy produkcyjne są zablokowane, a ekran operatora informuje dlaczego,
 - serię można zatrzymać w dowolnym momencie; statystyka liczy się z wykonanych cykli,
 - błąd stanowiska w jednym cyklu nie przerywa serii — zostaje policzony i opisany.
 
-Powstają dwa pliki:
+Powstają dwa pliki na serię:
 
-- `validation/loop_<próbka>_<data>.csv` — jeden wiersz na cykl, format jak raport produkcyjny,
-- `validation/loop_<próbka>_<data>_raport.txt` — podsumowanie, to samo co widać w oknie.
+- `validation/loop_<stanowisko>-<próbka>_<data>.csv` — jeden wiersz na cykl, format jak
+  raport produkcyjny,
+- `validation/loop_<stanowisko>-<próbka>_<data>_raport.txt` — podsumowanie, to samo co widać
+  w oknie.
 
 Raport zawiera: liczbę PASS/FAIL/ERROR i yield, ocenę powtarzalności, dla każdego profilu
 i fazy min/max/średnią/σ napięcia oraz **zapas do bliższej granicy** w mV i w % szerokości
@@ -293,7 +351,13 @@ Interpretacja zapasu: poniżej 5 % szerokości okna raport ostrzega, bo przy roz
 produkcyjnym należy się spodziewać fałszywych odrzutów. Poniżej 10 % warto obserwować.
 
 Czas: seria 20 cykli po ~30 s to ~11 minut z przerwami 2 s. Okno pokazuje szacunek przed
-startem i czas pozostały w trakcie.
+startem i czas pozostały w trakcie. Dwa gniazda walidowane równolegle to nadal ~11 minut,
+nie 22.
+
+Każde gniazdo waliduj **osobnym egzemplarzem** i porównaj raporty: różnica w zapasie do
+granicy między LEWYM a PRAWYM oznacza, że gniazda nie są równoważne (inna konfiguracja
+testera, inny kabel, inny styk) — wtedy ta sama sztuka może dostać różny wynik zależnie
+od tego, gdzie trafi.
 
 ## Panel inżynieryjny
 

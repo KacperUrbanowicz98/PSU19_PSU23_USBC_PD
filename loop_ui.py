@@ -32,6 +32,8 @@ class LoopWindow:
         on_state_change: Callable[[bool], None],
         on_closed: Callable[[], None] | None = None,
         station_name: str = "",
+        window_offset: int = 0,
+        station_busy: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.engine = engine
@@ -40,6 +42,10 @@ class LoopWindow:
         self.on_state_change = on_state_change
         self.on_closed = on_closed
         self.station_name = station_name
+        #: Przy seriach na kilku stanowiskach okna nie mogą się na siebie nakładać.
+        self.window_offset = max(0, window_offset)
+        #: Gniazdo i seria dzielą jednego klienta PM125, więc nie mogą pracować naraz.
+        self.station_busy = station_busy
 
         self.running = False
         self.cancel_event = threading.Event()
@@ -91,7 +97,7 @@ class LoopWindow:
         tk.Label(
             area,
             text=(
-                (f"Stanowisko {station_name} · " if station_name else "")
+                (f"Stanowisko {self.station_name} · " if self.station_name else "")
                 + "seria testów na jednej sztuce — bez zapisu do raportu produkcyjnego "
                   "i bez zużycia licznika prób"
             ),
@@ -269,6 +275,14 @@ class LoopWindow:
 
     def _start(self) -> None:
         if self.running:
+            return
+        if self.station_busy is not None and self.station_busy():
+            messagebox.showwarning(
+                "Tryb walidacyjny",
+                "Na tym gnieździe trwa test produkcyjny. Poczekaj na jego zakończenie — "
+                "seria i test dzielą ten sam tester.",
+                parent=self.window,
+            )
             return
         if not self.engine.hardware.connected:
             messagebox.showwarning(
@@ -475,6 +489,7 @@ class LoopWindow:
         screen_height = self.window.winfo_screenheight()
         width = min(max(self.window.winfo_width(), 900), screen_width - 60)
         height = min(max(self.window.winfo_height(), 620), screen_height - 120)
-        x = max(0, (screen_width - width) // 2)
-        y = max(0, (screen_height - height) // 3)
+        shift = self.window_offset * 46
+        x = max(0, min((screen_width - width) // 2 + shift, screen_width - width))
+        y = max(0, min((screen_height - height) // 3 + shift, screen_height - height))
         self.window.geometry(f"{width}x{height}+{x}+{y}")

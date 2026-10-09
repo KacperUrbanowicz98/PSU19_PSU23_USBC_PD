@@ -80,10 +80,11 @@ class StationPanel:
         header = tk.Frame(self.frame, bg=COLORS["primary"], height=56)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        tk.Label(
+        self.name_label = tk.Label(
             header, text=self.station.name, bg=COLORS["primary"], fg="white",
             font=("Segoe UI", 16, "bold"),
-        ).pack(side=tk.LEFT, padx=16)
+        )
+        self.name_label.pack(side=tk.LEFT, padx=16)
         self.connection_label = tk.Label(
             header, text="", bg=COLORS["error"], fg="white",
             font=("Segoe UI", 8, "bold"), padx=10, pady=5,
@@ -165,7 +166,10 @@ class StationPanel:
     def _refresh_idle(self) -> None:
         self.idle_pass.config(text=str(self.session_pass))
         self.idle_fail.config(text=str(self.session_non_pass))
-        if not self.hardware.connected:
+        if self.loop_active:
+            self.idle_headline.config(text="WALIDACJA", fg=COLORS["warning_soft"])
+            self.idle_hint.config(text="Trwa seria walidacyjna na tym gnieździe")
+        elif not self.hardware.connected:
             self.idle_headline.config(text="BRAK TESTERA", fg=COLORS["error_soft"])
             self.idle_hint.config(text=f"Tester {self.station.address} nie odpowiada")
         elif not self.services.operator_logged:
@@ -308,18 +312,26 @@ class StationPanel:
         self.sync_controls()
 
     @property
+    def loop_active(self) -> bool:
+        """Czy na tym gnieździe trwa seria walidacyjna (drugie gniazdo pracuje dalej)."""
+        return bool(self.services.loop_active(self.station.name))
+
+    @property
     def can_start(self) -> bool:
         return (
             self.services.operator_logged
             and self.hardware.connected
             and not self.busy
             and not self.services.blocked
+            and not self.loop_active
             and self.last_result is None
         )
 
     def _blocker_text(self) -> str:
         if self.busy:
             return "Test w toku..."
+        if self.loop_active:
+            return "Trwa seria walidacyjna na tym gnieździe."
         if self.services.blocked:
             return self.services.blocked_reason
         if not self.services.operator_logged:
@@ -335,7 +347,7 @@ class StationPanel:
         self.serial_entry.config(state=tk.NORMAL if start else tk.DISABLED)
         self.start_button.config(state=tk.NORMAL if start else tk.DISABLED)
         self.reconnect_button.config(
-            state=tk.DISABLED if (self.connecting or self.busy) else tk.NORMAL
+            state=tk.DISABLED if (self.connecting or self.busy or self.loop_active) else tk.NORMAL
         )
         self.blocker_label.config(text=self._blocker_text())
         self.update_connection_indicator()
@@ -649,6 +661,16 @@ class StationPanel:
             self.hardware.reconfigure(
                 config.console_path, self.station.device_serial, config.command_timeout
             )
+
+    def rebind(self, station: StationConfig, config: AppConfig) -> None:
+        """Przypina kanał do innego testera bez restartu aplikacji.
+
+        Używane po wykryciu testerów, gdy numer seryjny gniazda się zmienił.
+        """
+        self.station = station
+        self.name_label.config(text=station.name)
+        self.reconfigure(config)
+        self.sync_controls()
 
     def shutdown(self) -> None:
         self.cancel_event.set()

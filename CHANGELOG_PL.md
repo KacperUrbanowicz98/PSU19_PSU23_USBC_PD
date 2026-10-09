@@ -1,5 +1,82 @@
 # Zmiany
 
+## v5.2.0 — naprawa trybu walidacyjnego i serie na wszystkich testerach
+
+### Błąd: okno serii w ogóle się nie otwierało
+
+W v5.0, przy dodawaniu obsługi dwóch stanowisk, w budowie okna serii została odwołanie do
+nazwy `station_name` zamiast `self.station_name`. Efekt: `NameError` przy każdej próbie
+otwarcia trybu walidacyjnego — okno nie powstawało. Testy automatyczne tego nie złapały,
+bo sprawdzały `LoopRunner` (logikę serii), a nie budowę okna.
+
+- Błąd naprawiony.
+- Dodana klasa testów `GuiSmokeTests`, która **buduje okna** (okno serii, okno główne,
+  wybór stanowiska) i sprawdza, czy powstają. Przywrócenie starego kodu wywala te testy —
+  sprawdzone. Testy okien pomijają się same tam, gdzie nie ma Tkintera lub pulpitu.
+- Razem 74 testy.
+
+### Serie walidacyjne na wszystkich testerach, także równolegle
+
+- Każde gniazdo ma **własne okno serii**, z własnymi parametrami i własnym raportem.
+- Przy dwóch gniazdach pojawia się wybór: **LEWY**, **PRAWY** albo **WSZYSTKIE STANOWISKA
+  NARAZ**. Wcześniej było to pytanie tekstowe o nazwę stanowiska — trzeba było wpisać ją
+  z klawiatury.
+- Serie mogą biec **równolegle na wszystkich testerach**. Walidacja dwóch gniazd trwa tyle
+  co walidacja jednego (testery pracują niezależnie — współczynnik 0,52 z pomiaru).
+- Blokady zeszły z poziomu całej aplikacji na **poziom gniazda**: seria na LEWYM blokuje
+  produkcję tylko na LEWYM, PRAWY testuje dalej. Wcześniej jedna seria zatrzymywała całe
+  stanowisko.
+- Panel gniazda w trakcie serii pokazuje **WALIDACJA** i podaje powód blokady.
+- Test produkcyjny i seria na tym samym gnieździe dzielą jednego klienta PM125, więc nie
+  mogą iść naraz — próba uruchomienia serii w trakcie testu kończy się komunikatem zamiast
+  kolizją na konsoli.
+- Kontrola obecności testera pomija gniazdo z serią w toku (żadnych dodatkowych komend
+  w trakcie pomiaru), pozostałe gniazda sprawdza normalnie.
+- Przycisk „Połącz ponownie" gniazda jest nieaktywny w trakcie jego serii.
+- Okna serii dla kolejnych gniazd otwierają się z przesunięciem, żeby się nie zasłaniały.
+- Nazwa stanowiska jest w nazwie plików raportu (`loop_LEWY-WALIDACJA_...`), więc serie
+  z obu gniazd się nie mieszają.
+- Zamknięcie aplikacji w trakcie serii wymienia, na których gniazdach one trwają.
+
+## v5.1.0 — wykrywanie testerów dostępne dla operatora
+
+Powód: na stanowisku po zalogowaniu nie wykryto prawego testera, bo zgłosił się pod innym
+numerem seryjnym niż zapisany w konfiguracji. Do tej pory naprawa wymagała hasła
+inżynieryjnego, więc produkcja musiała wołać inżyniera przy zmianie, która nie dotyczy
+kryteriów testu.
+
+### Przycisk WYKRYJ TESTERY
+
+- Nowy przycisk obok **Zaloguj / Wyloguj**, **bez hasła**. Odpytuje konsolę (`-f`),
+  porównuje wynik ze skonfigurowanymi gniazdami i proponuje przepięcie.
+- Nazwy i kolejność gniazd są zachowywane — LEWY zostaje LEWY, zmienia się tylko numer
+  seryjny testera. Gniazda, których numer się zgadza, nie są ruszane.
+- Zmiana wchodzi **bez restartu aplikacji**: klient PM125 każdego kanału jest przepinany
+  w locie i od razu następuje ponowne połączenie.
+- Każda zmiana trafia do `config_audit.log` razem z numerem HRID operatora, który ją
+  zatwierdził.
+- Zakres działania jest celowo wąski: przycisk nie dotyka kryteriów, czasów faz, profili,
+  listy HRID ani hasła inżynieryjnego.
+- Przycisk jest nieaktywny w trakcie testu i w trakcie serii walidacyjnej; w trybie
+  symulatora informuje, że nie ma czego wykrywać.
+- Wykrycie większej liczby testerów niż gniazd proponuje dołożenie kanału — to zmienia
+  układ okna, więc wymaga ponownego uruchomienia; aplikacja wyraźnie o tym mówi.
+- Mniej testerów niż gniazd: gniazdo bez testera zostaje nietknięte i jest wymienione
+  w komunikacie, zamiast po cichu zniknąć.
+
+### Nowy moduł
+
+- `detection.py` — dopasowanie wykrytych testerów do gniazd wyliczane poza GUI, bez
+  zapisu na dysk, dzięki czemu jest w całości pokryte testami (9 nowych testów, razem 70).
+
+### Dokumentacja
+
+- `INSTALACJA_PL.md` — przygotowanie nowego komputera pod aplikację: sterownik i konsola
+  PassMark, wariant EXE i wariant z Pythonem, układ folderów, uprawnienia, skrót,
+  konfiguracja, diagnostyka `check_dual.py`, walidacja przed oddaniem do produkcji,
+  utrzymanie i tabela najczęstszych problemów.
+- README: osobny rozdział o przycisku WYKRYJ TESTERY z sytuacjami brzegowymi.
+
 ## v5.0.0 — obsługa dwóch stanowisk i wnioski z diagnostyki konsoli
 
 Diagnostyka na stanowisku (`check_dual.py`) wykazała, że dwie instancje

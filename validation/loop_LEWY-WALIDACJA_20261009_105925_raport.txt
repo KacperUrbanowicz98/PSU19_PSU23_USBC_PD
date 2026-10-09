@@ -1,0 +1,46 @@
+==============================================================================
+  RAPORT WALIDACYJNY STANOWISKA — PSU19 Tester 5.0.0
+==============================================================================
+Próbka:            LEWY-WALIDACJA
+Operator (HRID):   12101333
+Start / koniec:    2026-10-09 10:48:24 — 2026-10-09 10:59:25
+Cykle:             20 z 20
+
+Wyniki:            PASS 20 · FAIL 0 · ERROR 0   (yield 100.0 %)
+Czas cyklu:        średnio 28.3 s  (min 27.9 s, max 30.3 s)
+Komenda PM125:     średnio 569 ms
+
+POWTARZALNOŚĆ STANOWISKA
+------------------------------------------------------------------------------
+  TAK — wszystkie 20 cykli dało ten sam werdykt (PASS).
+
+NAPIĘCIE — margines do granic kryteriów
+------------------------------------------------------------------------------
+Profil  Faza              min [V]  max [V]   śr [V]   σ [mV]  zapas [mV]  zapas [%]
+5V      bez obciążenia      5.135    5.165    5.149      7.4         335       44.7
+5V      z obciążeniem       5.012    5.086    5.049     20.4         262       34.9
+9V      bez obciążenia      8.988    9.024    9.006      6.1         426       47.3
+9V      z obciążeniem       8.840    8.908    8.878     14.5         290       32.2
+12V     bez obciążenia     12.000   12.037   12.012      6.7         563       46.9
+12V     z obciążeniem      11.840   11.908   11.869     14.0         440       36.7
+15V     bez obciążenia     15.074   15.098   15.086      6.2         652       43.5
+15V     z obciążeniem      14.933   14.982   14.957     13.1         683       45.5
+
+  zapas = odległość najgorszego pomiaru serii od bliższej granicy kryterium
+  zapas [%] = zapas odniesiony do szerokości okna kryterium
+
+  Najciaśniej: 9V z obciążeniem — zapas 290 mV (32.2 %), granice 8.55–9.45 V
+
+PRĄD POD OBCIĄŻENIEM — czy obciążenie trzyma nastawę
+------------------------------------------------------------------------------
+Profil     min [A]   max [A]    śr [A]    σ [mA]       granice [A]
+5V           2.994     3.011     3.000       2.9     2.40–3.60    
+9V           2.995     3.006     3.000       2.7     2.40–3.60    
+12V          2.994     3.006     3.000       3.2     2.40–3.60    
+15V          2.394     2.407     2.401       3.3     1.92–2.88    
+
+WNIOSEK
+------------------------------------------------------------------------------
+  Stanowisko powtarzalne: 20 cykli, wszystkie PASS, najmniejszy zapas 32.2 %.
+
+Seria walidacyjna nie trafia do raportu produkcyjnego i nie zużywa licznika prób.

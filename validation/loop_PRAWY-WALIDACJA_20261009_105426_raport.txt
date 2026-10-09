@@ -1,0 +1,70 @@
+==============================================================================
+  RAPORT WALIDACYJNY STANOWISKA — PSU19 Tester 5.0.0
+==============================================================================
+Próbka:            PRAWY-WALIDACJA
+Operator (HRID):   12101333
+Start / koniec:    2026-10-09 10:48:21 — 2026-10-09 10:54:26
+Cykle:             20 z 20
+
+Wyniki:            PASS 7 · FAIL 3 · ERROR 10   (yield 35.0 %)
+Czas cyklu:        średnio 25.4 s  (min 2.7 s, max 29.5 s)
+Komenda PM125:     średnio 668 ms
+
+POWTARZALNOŚĆ STANOWISKA
+------------------------------------------------------------------------------
+  NIE — 10 cykli zakończyło się błędem stanowiska. Stanowisko nie jest gotowe do produkcji.
+
+NAPIĘCIE — margines do granic kryteriów
+------------------------------------------------------------------------------
+Profil  Faza              min [V]  max [V]   śr [V]   σ [mV]  zapas [mV]  zapas [%]
+5V      bez obciążenia      5.147    5.165    5.156      5.6         335       44.7
+5V      z obciążeniem       4.742    4.803    4.778     19.3          -8       -1.1
+9V      bez obciążenia      8.969    9.012    9.002      8.7         419       46.6
+9V      z obciążeniem       8.570    8.638    8.602     19.2          20        2.2
+12V     bez obciążenia     11.975   12.012   11.994      8.3         575       47.9
+12V     z obciążeniem      11.564   11.613   11.585     12.7         164       13.7
+15V     bez obciążenia     15.049   15.074   15.059      6.9         676       45.1
+15V     z obciążeniem      14.638   14.712   14.680     17.5         388       25.9
+
+  zapas = odległość najgorszego pomiaru serii od bliższej granicy kryterium
+  zapas [%] = zapas odniesiony do szerokości okna kryterium
+
+  Najciaśniej: 5V z obciążeniem — zapas -8 mV (-1.1 %), granice 4.75–5.50 V
+  UWAGA: zapas poniżej 5 % szerokości okna — przy rozrzucie produkcyjnym należy się spodziewać fałszywych odrzutów.
+
+DRYF W SERII (trend napięcia między cyklami)
+------------------------------------------------------------------------------
+  12V    bez obciążenia   +1.13 mV/cykl  (łącznie +21 mV w serii)
+  15V    z obciążeniem    -1.92 mV/cykl  (łącznie -36 mV w serii)
+
+  Systematyczny dryf zwykle oznacza nagrzewanie się zasilacza lub obciążenia.
+
+PRĄD POD OBCIĄŻENIEM — czy obciążenie trzyma nastawę
+------------------------------------------------------------------------------
+Profil     min [A]   max [A]    śr [A]    σ [mA]       granice [A]
+5V           2.994     3.006     3.000       2.6     2.40–3.60    
+9V           2.990     3.005     3.000       2.9     2.40–3.60    
+12V          2.995     3.007     3.000       3.5     2.40–3.60    
+15V          2.395     2.408     2.401       3.6     1.92–2.88    
+
+ZDARZENIA W SERII
+------------------------------------------------------------------------------
+  cykl 1: ERROR — USBPDConsole: nie udało się połączyć z testerem (kod 3) — Error: Device not found.
+  cykl 3: FAIL — 5V z obciążeniem: napięcie 4.742 V poza zakresem 4.75-5.50 V
+  cykl 7: FAIL — 5V z obciążeniem: napięcie 4.742 V poza zakresem 4.75-5.50 V
+  cykl 10: FAIL — 5V z obciążeniem: napięcie 4.748 V poza zakresem 4.75-5.50 V
+  cykl 12: ERROR — 5V: za mało ocenianych pomiarów (bez obciążenia 3, z obciążeniem 0, wymagane 2). Sprawdź stanowisko.; Nie udało się przywrócić 5 V / 0 mA.
+  cykl 13: PM125 nie jest połączony.
+  cykl 14: PM125 nie jest połączony.
+  cykl 15: PM125 nie jest połączony.
+  cykl 16: PM125 nie jest połączony.
+  cykl 17: PM125 nie jest połączony.
+  cykl 18: PM125 nie jest połączony.
+  cykl 19: PM125 nie jest połączony.
+  cykl 20: PM125 nie jest połączony.
+
+WNIOSEK
+------------------------------------------------------------------------------
+  Stanowisko NIEGOTOWE: 10 z 20 cykli zakończyło się błędem stanowiska. Usuń przyczynę przed wdrożeniem.
+
+Seria walidacyjna nie trafia do raportu produkcyjnego i nie zużywa licznika prób.
