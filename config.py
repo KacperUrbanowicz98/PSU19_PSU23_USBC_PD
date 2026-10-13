@@ -15,6 +15,10 @@ from models import TestProfile
 
 logger = logging.getLogger(__name__)
 
+#: Jedyne miejsce z numerem wersji. Builder EXE czyta go stąd, raporty też —
+#: dzięki temu wersja w raporcie nie może rozjechać się z wersją binarki.
+APP_VERSION = "5.5.0"
+
 
 class ConfigError(RuntimeError):
     pass
@@ -99,6 +103,13 @@ def password_hash(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
+#: SHA-256 standardowego hasła inżynieryjnego stanowiska. Wartość, nie wywołanie —
+#: patrz komentarz przy polu `engineering_password_hash`.
+DEFAULT_ENGINEERING_PASSWORD_HASH = (
+    "8d9748d5a14e921cbd3c4029ffde98fbf7e59c8b828e04c2b70dae67e81d7070"
+)
+
+
 @dataclass(slots=True)
 class AppConfig:
     # --- ścieżki i urządzenie ---
@@ -165,7 +176,11 @@ class AppConfig:
     stations: list[StationConfig] = field(default_factory=_default_stations)
     profiles: list[TestProfile] = field(default_factory=_default_profiles)
     valid_hrids: list[str] = field(default_factory=_default_hrids)
-    engineering_password_hash: str = field(default_factory=lambda: password_hash("reconext2025"))
+    #: Hasło inżynieryjne jest statyczne i niezmienne z poziomu aplikacji (wymaganie
+    #: właściciela). Trzymamy tu gotowy skrót zamiast `password_hash("...")`, żeby samo
+    #: hasło nie trafiło do binarki jako jawny napis — build nie jest podpisany, więc
+    #: literal dałoby się wyciągnąć poleceniem `strings`. Hasło pozostaje to samo.
+    engineering_password_hash: str = DEFAULT_ENGINEERING_PASSWORD_HASH
 
     # ------------------------------------------------------------------ IO
 

@@ -20,13 +20,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from config import AppConfig
+from config import APP_VERSION, AppConfig
 from engine import TestEngine
 from models import PHASE_LABELS, PHASE_LOAD, PHASE_NO_LOAD, FinalStatus, TestResult
 
 logger = logging.getLogger(__name__)
 
-APP_VERSION = "5.0.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +76,30 @@ class PhaseStatistics:
         return (self.worst_margin / width * 100.0) if width > 0 else 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class SourceResistance:
+    """Rezystancja szeregowa toru: zasilacz + kabel + styk + wejście testera.
+
+    Liczona z danych, które seria i tak zbiera: ze spadku napięcia między fazą bez
+    obciążenia a fazą z obciążeniem, podzielonego przez zmierzony prąd. Pozwala
+    porównywać gniazda jedną liczbą — sam spadek napięcia zależy od prądu profilu,
+    rezystancja nie.
+    """
+
+    profile: str
+    no_load_volts: float
+    loaded_volts: float
+    current_amps: float
+
+    @property
+    def drop_volts(self) -> float:
+        return self.no_load_volts - self.loaded_volts
+
+    @property
+    def milliohms(self) -> float:
+        return (self.drop_volts / self.current_amps * 1000.0) if self.current_amps else 0.0
+
+
 @dataclass(slots=True)
 class LoopSummary:
     label: str
@@ -96,6 +119,10 @@ class LoopSummary:
     problems: list[str] = field(default_factory=list)
     report_path: Path | None = None
     data_path: Path | None = None
+    #: Ile razy w serii trzeba było odzyskać połączenie z testerem.
+    reconnects: int = 0
+    #: Wypełnione, gdy seria została przerwana — np. tester przestał odpowiadać.
+    aborted_reason: str = ""
 
     @property
     def yield_percent(self) -> float:
@@ -110,6 +137,25 @@ class LoopSummary:
         return statistics.fmean(self.command_seconds) * 1000.0 if self.command_seconds else 0.0
 
     @property
+    def source_resistances(self) -> list[SourceResistance]:
+        """Rezystancja toru per profil — liczona z już zebranej statystyki."""
+        no_load = {item.profile: item.average for item in self.phases if item.phase == PHASE_NO_LOAD}
+        loaded = {item.profile: item.average for item in self.phases if item.phase == PHASE_LOAD}
+        currents = {item.profile: item.average for item in self.current_stats}
+        output: list[SourceResistance] = []
+        for profile, idle_volts in no_load.items():
+            if profile in loaded and currents.get(profile):
+                output.append(
+                    SourceResistance(profile, idle_volts, loaded[profile], currents[profile])
+                )
+        return output
+
+    @property
+    def average_milliohms(self) -> float:
+        values = [item.milliohms for item in self.source_resistances]
+        return statistics.fmean(values) if values else 0.0
+
+    @property
     def worst_phase(self) -> PhaseStatistics | None:
         return min(self.phases, key=lambda item: item.worst_margin_percent, default=None)
 
@@ -121,6 +167,11 @@ class LoopSummary:
 
 class LoopRunner:
     """Wykonuje serię testów i buduje z nich statystykę."""
+
+    #: Ile razy przed cyklem próbować odzyskać utracony tester.
+    RECONNECT_ATTEMPTS = 3
+    #: Przerwa między próbami odzyskania — USB potrzebuje chwili na ponowne zgłoszenie.
+    RECONNECT_PAUSE_SECONDS = 2.0
 
     def __init__(self, config: AppConfig, engine: TestEngine) -> None:
         self.config = config
@@ -151,6 +202,9 @@ class LoopRunner:
         for cycle in range(1, cycles + 1):
             if cancel_event and cancel_event.is_set():
                 summary.cancelled = True
+                break
+
+            if not self._ensure_connected(summary, cycle, cancel_event, progress, started_at):
                 break
 
             if progress:
@@ -221,6 +275,62 @@ class LoopRunner:
             summary.passed, summary.failed, summary.errors, summary.cycles_done,
         )
         return summary, results
+
+    def _ensure_connected(
+        self,
+        summary: LoopSummary,
+        cycle: int,
+        cancel_event: threading.Event | None,
+        progress: LoopProgressCallback | None,
+        started_at: float,
+    ) -> bool:
+        """Odzyskuje połączenie z testerem przed cyklem.
+
+        Bez tego pojedyncza utrata urządzenia (kod 2 albo 3) kasowała resztę serii:
+        kolejne cykle kończyły się natychmiast komunikatem „PM125 nie jest połączony”,
+        a raport pokazywał kilkanaście fałszywych ERROR-ów zamiast jednego zdarzenia.
+        """
+        hardware = self.engine.hardware
+        if hardware.connected:
+            return True
+
+        for attempt in range(1, self.RECONNECT_ATTEMPTS + 1):
+            if cancel_event and cancel_event.is_set():
+                summary.cancelled = True
+                return False
+            if progress:
+                progress(
+                    LoopProgress(
+                        cycle, summary.cycles_planned, "odzyskiwanie", "",
+                        summary.passed, summary.failed, summary.errors,
+                        time.monotonic() - started_at,
+                    )
+                )
+            try:
+                hardware.forget_state()
+                restored = hardware.connect()
+            except Exception as exc:
+                logger.warning("Tryb walidacyjny: próba odzyskania %s nie powiodła się: %s",
+                               attempt, exc)
+                restored = False
+            if restored:
+                summary.reconnects += 1
+                summary.problems.append(
+                    f"cykl {cycle}: odzyskano połączenie z testerem (próba {attempt})"
+                )
+                logger.info("Tryb walidacyjny: odzyskano tester przed cyklem %s.", cycle)
+                return True
+            self._sleep(self.RECONNECT_PAUSE_SECONDS, cancel_event)
+
+        reason = (
+            f"tester nie odpowiada od cyklu {cycle} "
+            f"({self.RECONNECT_ATTEMPTS} nieudane próby odzyskania): "
+            f"{getattr(hardware, 'last_error', '') or 'brak urządzenia'}"
+        )
+        summary.aborted_reason = reason
+        summary.problems.append(f"cykl {cycle}: PRZERWANO SERIĘ — {reason}")
+        logger.error("Tryb walidacyjny: przerwano serię — %s", reason)
+        return False
 
     @staticmethod
     def _sleep(seconds: float, cancel_event: threading.Event | None) -> None:
@@ -372,10 +482,19 @@ def build_report_lines(summary: LoopSummary) -> list[str]:
     lines.append(f"Próbka:            {summary.label}")
     lines.append(f"Operator (HRID):   {summary.hrid}")
     lines.append(f"Start / koniec:    {summary.started} — {summary.finished}")
-    lines.append(
-        f"Cykle:             {summary.cycles_done} z {summary.cycles_planned}"
-        + ("  (seria przerwana)" if summary.cancelled else "")
-    )
+    note = ""
+    if summary.cancelled:
+        note = "  (seria zatrzymana przez operatora)"
+    elif summary.aborted_reason:
+        note = "  (seria przerwana — tester przestał odpowiadać)"
+    lines.append(f"Cykle:             {summary.cycles_done} z {summary.cycles_planned}{note}")
+    if summary.reconnects:
+        lines.append(
+            f"Odzyskania testera: {summary.reconnects} "
+            "— tester zniknął w trakcie serii i został odzyskany"
+        )
+    if summary.aborted_reason:
+        lines.append(f"Przerwanie:        {summary.aborted_reason}")
     lines.append("")
     lines.append(
         f"Wyniki:            PASS {summary.passed} · FAIL {summary.failed} · ERROR {summary.errors}"
@@ -472,6 +591,38 @@ def build_report_lines(summary: LoopSummary) -> list[str]:
             )
         lines.append("")
 
+    resistances = summary.source_resistances
+    if resistances:
+        lines.append("REZYSTANCJA TORU — zasilacz + kabel + styk + wejście testera")
+        lines.append("-" * 78)
+        lines.append(
+            f"{'Profil':<8}{'U bez obc. [V]':>16}{'U pod obc. [V]':>16}"
+            f"{'spadek [mV]':>13}{'prąd [A]':>10}{'R [mΩ]':>10}"
+        )
+        for item in resistances:
+            lines.append(
+                f"{item.profile:<8}{item.no_load_volts:>16.3f}{item.loaded_volts:>16.3f}"
+                f"{item.drop_volts * 1000:>13.0f}{item.current_amps:>10.3f}"
+                f"{item.milliohms:>10.0f}"
+            )
+        lines.append(f"{'ŚREDNIO':<8}{'':>16}{'':>16}{'':>13}{'':>10}"
+                     f"{summary.average_milliohms:>10.0f}")
+        lines.append("")
+        lines.append(
+            "  Spadek napięcia zależy od prądu profilu, rezystancja nie — dlatego to ona"
+        )
+        lines.append(
+            "  nadaje się do porównywania gniazd. Różnica R między stanowiskami oznacza"
+        )
+        lines.append(
+            "  gorszy kabel, zużyte gniazdo albo słaby styk, a nie gorszy wyrób: ten sam"
+        )
+        lines.append(
+            "  zasilacz da na takim gnieździe niższe napięcie pod obciążeniem i wpadnie"
+        )
+        lines.append("  w fałszywy FAIL.")
+        lines.append("")
+
     if summary.problems:
         lines.append("ZDARZENIA W SERII")
         lines.append("-" * 78)
@@ -491,37 +642,65 @@ def build_report_lines(summary: LoopSummary) -> list[str]:
 
 
 def verdict_lines(summary: LoopSummary) -> list[str]:
-    """Krótka ocena serii — to samo zdanie trafia do raportu i na ekran."""
+    """Ocena serii — osobne zdanie na każdy wniosek.
+
+    Wnioski nie wykluczają się nawzajem: problem z łącznością nie może przykryć
+    informacji o ciasnym marginesie, bo to dwie różne przyczyny i dwa różne działania.
+    """
     if summary.cycles_done == 0:
         return ["Brak wykonanych cykli."]
-    if summary.errors:
-        return [
-            f"Stanowisko NIEGOTOWE: {summary.errors} z {summary.cycles_done} cykli zakończyło się "
-            "błędem stanowiska. Usuń przyczynę przed wdrożeniem.",
-        ]
+
+    lines: list[str] = []
     worst = summary.worst_phase
-    if not summary.repeatable:
-        return [
+
+    if summary.aborted_reason:
+        lines.append(
+            f"Seria PRZERWANA: {summary.aborted_reason}. Statystyka poniżej liczy się "
+            f"z {summary.cycles_done} wykonanych cykli i jest niepełna."
+        )
+    if summary.errors:
+        lines.append(
+            f"Stanowisko NIEGOTOWE: {summary.errors} z {summary.cycles_done} cykli zakończyło się "
+            "błędem stanowiska. Usuń przyczynę przed wdrożeniem."
+        )
+    if summary.reconnects and not summary.aborted_reason:
+        lines.append(
+            f"Tester zniknął i wrócił {summary.reconnects} raz(y) w serii. To problem "
+            "połączenia (kabel, port, zasilanie huba), nie wyrobu — na produkcji objawi się "
+            "losowymi błędami stanowiska."
+        )
+
+    if worst is not None and worst.worst_margin < 0:
+        lines.append(
+            f"Kryterium PRZEKROCZONE w serii: {worst.profile} {PHASE_LABELS[worst.phase]} "
+            f"zeszło {abs(worst.worst_margin) * 1000:.0f} mV poza granicę. Ten sam egzemplarz "
+            "raz przechodzi, raz nie — stanowisko albo wyrób leżą dokładnie na progu."
+        )
+    elif not summary.repeatable and not summary.errors:
+        lines.append(
             "Wynik NIEPOWTARZALNY: ten sam egzemplarz raz przechodzi, raz nie. "
-            "Zwykle oznacza to kryterium przechodzące przez rozrzut pomiaru.",
-        ]
-    if summary.failed == summary.cycles_done:
+            "Zwykle oznacza to kryterium przechodzące przez rozrzut pomiaru."
+        )
+    elif worst is not None and worst.worst_margin_percent < 5:
+        lines.append(
+            f"Margines jest ciasny ({worst.profile} {PHASE_LABELS[worst.phase]}: "
+            f"{worst.worst_margin_percent:.1f} %). Przed wdrożeniem sprawdź serię na kilku "
+            "egzemplarzach."
+        )
+
+    if not lines:
+        if summary.failed == summary.cycles_done:
+            return [
+                "Egzemplarz konsekwentnie FAIL we wszystkich cyklach — wynik wiarygodny, "
+                "ale to ocena wyrobu, nie stanowiska."
+            ]
         return [
-            "Egzemplarz konsekwentnie FAIL we wszystkich cyklach — wynik wiarygodny, "
-            "ale to ocena wyrobu, nie stanowiska.",
+            f"Stanowisko powtarzalne: {summary.cycles_done} cykli, wszystkie PASS, "
+            f"najmniejszy zapas {worst.worst_margin_percent:.1f} %."
+            if worst
+            else f"Stanowisko powtarzalne: {summary.cycles_done} cykli, wszystkie PASS."
         ]
-    if worst is not None and worst.worst_margin_percent < 5:
-        return [
-            f"Powtarzalność OK, ale margines jest ciasny ({worst.profile} "
-            f"{PHASE_LABELS[worst.phase]}: {worst.worst_margin_percent:.1f} %). "
-            "Przed wdrożeniem sprawdź serię na kilku egzemplarzach.",
-        ]
-    return [
-        f"Stanowisko powtarzalne: {summary.cycles_done} cykli, wszystkie PASS, "
-        f"najmniejszy zapas {worst.worst_margin_percent:.1f} %."
-        if worst
-        else f"Stanowisko powtarzalne: {summary.cycles_done} cykli, wszystkie PASS.",
-    ]
+    return lines
 
 
 def _slope(values: list[float]) -> float:

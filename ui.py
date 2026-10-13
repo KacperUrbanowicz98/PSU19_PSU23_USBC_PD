@@ -631,10 +631,7 @@ class TesterApp:
                 try:
                     if kind == "connection":
                         _, panel, connected, error = event
-                        panel.connecting = False
-                        if not connected and error:
-                            logger.warning("[%s] Brak testera: %s", panel.station.name, error)
-                        panel.sync_controls()
+                        panel.report_connection(connected, error)
                         self._update_operator_state()
                     elif kind == "health":
                         _, panel, alive, error = event

@@ -67,6 +67,7 @@ class StationPanel:
         self.last_result: TestResult | None = None
         self._result_clear_job: str | None = None
         self._activity_step = 0
+        self._connection_error = ""
 
         self.frame = tk.Frame(
             parent, bg=COLORS["card"], highlightbackground=COLORS["border"], highlightthickness=1
@@ -369,6 +370,22 @@ class StationPanel:
 
     # ------------------------------------------------------------------ sprzęt
 
+    def report_connection(self, connected: bool, error: str) -> None:
+        """Wynik próby połączenia. Powtarzalny błąd logowany jest raz, odzyskanie zawsze.
+
+        Automatyczne próby odzyskania idą co cykl kontroli obecności, więc bez tego
+        log zalewałby się tym samym komunikatem co 20 s.
+        """
+        self.connecting = False
+        if connected:
+            if self._connection_error:
+                logger.info("[%s] Tester odzyskany.", self.station.name)
+            self._connection_error = ""
+        elif error and error != self._connection_error:
+            self._connection_error = error
+            logger.warning("[%s] Brak testera: %s", self.station.name, error)
+        self.sync_controls()
+
     def connect_hardware(self) -> None:
         if self.connecting or self.busy:
             return
@@ -386,7 +403,14 @@ class StationPanel:
         threading.Thread(target=worker, daemon=True, name=f"connect-{self.station.name}").start()
 
     def health_check(self) -> None:
-        if self.busy or self.connecting or not self.hardware.connected:
+        if self.busy or self.connecting or self.loop_active:
+            return
+        if not self.hardware.connected:
+            # Automatyczna próba odzyskania po chwilowej utracie USB. Bez tego gniazdo
+            # zostawało w stanie BRAK TESTERA aż do ręcznego kliknięcia „Połącz ponownie".
+            logger.info("[%s] Tester niedostępny — automatyczna próba odzyskania.",
+                        self.station.name)
+            self.connect_hardware()
             return
 
         def worker() -> None:

@@ -57,48 +57,72 @@ dwóch sztukach na pasywnym hubie potrafi się rozłączać w trakcie testu.
 
 ## 3. Wariant EXE (stanowisko produkcyjne)
 
-### 3.1 Zbuduj EXE na komputerze inżynierskim
+### 3.1 Zbuduj wydanie na komputerze inżynierskim
 
 Na maszynie z Pythonem, w folderze projektu:
 
 ```powershell
-pip install -r requirements-dev.txt
+approve_sources.bat      REM po sprawdzeniu zmian — zatwierdza sumy SHA-256 źródeł
 build_exe.bat
 ```
 
-Wynik: `dist\PSU19Tester.exe` — jeden plik, bez zależności.
+Builder sam, zanim cokolwiek zbuduje:
+
+1. sprawdza środowisko (Windows, Python 3.10+, PyInstaller 6.x, tkinter),
+2. kompiluje wszystkie źródła i uruchamia **pełne testy automatyczne**,
+3. sprawdza zachowanie aplikacji: czy domyślna konfiguracja przechodzi walidację, czy
+   hasło inżynieryjne działa, a błędne i puste odpada, czy progi profili zgadzają się ze
+   specyfikacją wyrobu i czy fazy 2,5 s + 2,5 s mieszczą się w timeoucie,
+4. porównuje sumy SHA-256 źródeł z `approved_sources.json`,
+5. sprawdza, czy w kodzie są obecne bramki, których wycięcie przeszłoby niezauważone
+   (pierwszeństwo błędu stanowiska nad FAIL, odzyskiwanie testera, licznik prób,
+   hasło panelu).
+
+Każda z tych kontroli **zatrzymuje build**. To kontrola pomyłek, nie zabezpieczenie przed
+świadomą zmianą kodu — podmiana treści funkcji przy zachowanej nazwie przejdzie.
+
+Wynik: folder `dist\PSU19 Tester\` oraz `build_manifest.txt` z sumami SHA-256 wszystkich
+plików wydania.
 
 ### 3.2 Rozłóż pliki na stanowisku
 
-Utwórz folder aplikacji — **nie w `C:\Program Files`** (tam operator nie zapisze raportów):
+Skopiuj **CAŁY FOLDER** `PSU19 Tester` — nie samo EXE. Aplikacja jest budowana w trybie
+onedir, więc biblioteki leżą obok pliku wykonywalnego w `_internal\`.
+
+Docelowa lokalizacja — **nie `C:\Program Files`** (tam operator nie zapisze raportów):
 
 ```text
 C:\PSU19Tester\
-    PSU19Tester.exe          ← jedyny plik, który kopiujesz
-    test_config.json         ← tworzy się sam przy pierwszym starcie
-    reports\                 ← raporty CSV (tworzy się sam)
-    backup\                  ← kopie awaryjne raportów
-    logs\                    ← logi aplikacji
-    raw\                     ← surowe próbki pomiarowe
-    validation\              ← raporty serii walidacyjnych
-    serial_attempts.json     ← licznik prób numerów seryjnych
-    pending_results.json     ← wyniki, których nie udało się zapisać
-    config_audit.log         ← dziennik zmian konfiguracji
+    PSU19 Tester.exe         ← plik uruchamiany
+    _internal\               ← biblioteki i runtime Tcl/Tk (NIE ruszaj)
+    test_config.json         ← konfiguracja stanowiska, edytowalna z panelu
+    README_PL.md             ← dokumentacja obsługi
+    INSTALACJA_PL.md         ← ten dokument
+    CHANGELOG_PL.md          ← historia zmian
+    build_manifest.txt       ← sumy SHA-256 wydania
+    reports\                 ← raporty CSV            ┐
+    backup\                  ← kopie awaryjne         │
+    logs\                    ← logi aplikacji         │ aplikacja zakłada
+    raw\                     ← surowe próbki          │ je sama przy
+    validation\              ← raporty serii          │ pierwszym starcie
+    serial_attempts.json     ← licznik prób           │
+    pending_results.json     ← niezapisane wyniki     │
+    config_audit.log         ← dziennik zmian         ┘
 ```
 
-Wszystkie foldery i pliki danych aplikacja zakłada sama, obok `.exe`. Skopiuj **tylko**
-`PSU19Tester.exe`.
+Co musi zostać razem: `_internal\` (bez niego EXE nie wystartuje) oraz `test_config.json`
+(bez niego aplikacja odtworzy ustawienia domyślne — jedno gniazdo i adres „Any”).
 
 ### 3.3 Uprawnienia
 
-Konto operatora musi mieć pełny zapis do `C:\PSU19Tester`. Sprawdzenie:
+Konto operatora musi mieć prawo zapisu do `C:\PSU19Tester`. Sprawdzenie:
 
 ```powershell
 icacls C:\PSU19Tester
 ```
 
-Nadanie (z konta administratora — `-WhatIf` nie dotyczy `icacls`, więc najpierw zobacz
-powyższy odczyt i dopiero potem uruchom poniższe):
+Nadanie (z konta administratora — zobacz najpierw powyższy odczyt, `icacls` nie ma trybu
+podglądu zmian i działa od razu; zasięg to cały podkatalog wraz z zawartością):
 
 ```powershell
 icacls C:\PSU19Tester /grant "Users:(OI)(CI)M" /T
@@ -109,11 +133,23 @@ zmieniać uprawnienia.
 
 ### 3.4 Skrót na pulpicie
 
-Skrót do `C:\PSU19Tester\PSU19Tester.exe`, pole **Rozpocznij w:** ustaw na
-`C:\PSU19Tester`. Bez tego aplikacja założy foldery danych tam, skąd została uruchomiona.
+Skrót do `C:\PSU19Tester\PSU19 Tester.exe`, pole **Rozpocznij w:** ustaw na
+`C:\PSU19Tester`.
+
+Aplikacja i tak przestawia katalog roboczy na folder EXE (robi to hook startowy), więc
+foldery danych powstaną we właściwym miejscu nawet przy źle ustawionym skrócie — ale pole
+**Rozpocznij w:** warto ustawić poprawnie, bo tak zachowują się inne stanowiska.
 
 Autostart (opcjonalnie): skrót w
 `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp`.
+
+### 3.5 Aktualizacja wersji
+
+Podmień `PSU19 Tester.exe` **i folder `_internal\`** — to jedna całość, pochodzą z tego
+samego buildu. `test_config.json`, foldery danych i liczniki zostają nietknięte.
+
+Numer wersji sprawdzisz w nagłówku raportu walidacyjnego, w `build_manifest.txt` oraz we
+właściwościach pliku EXE (zakładka Szczegóły).
 
 ---
 
@@ -135,7 +171,7 @@ Autostart (opcjonalnie): skrót w
    run_tests.bat
    ```
 
-   Oczekiwany wynik: `Ran 74 tests ... OK`.
+   Oczekiwany wynik: `Ran 83 tests ... OK`.
 
 5. Uruchomienie bez testera (sprawdzenie interfejsu):
 
@@ -241,8 +277,8 @@ Najważniejsze, na co patrzysz w raporcie:
 | Sprawdzenie `config_audit.log` | przy audycie — jest tam każda zmiana konfiguracji z HRID |
 | Czyszczenie `raw\`, `logs\` | automatyczne (retencja 30 / 14 dni) |
 
-Aktualizacja aplikacji w wariancie EXE: podmień `PSU19Tester.exe`. `test_config.json`
-i foldery danych zostają nietknięte.
+Aktualizacja aplikacji w wariancie EXE: patrz punkt 3.5 — podmieniasz EXE **razem
+z folderem `_internal\`**. `test_config.json` i foldery danych zostają nietknięte.
 
 ---
 
@@ -255,5 +291,8 @@ i foldery danych zostają nietknięte.
 | Widać jedno gniazdo zamiast dwóch | jeden wpis w `stations` | **WYKRYJ TESTERY**, potwierdź dołożenie kanału, uruchom ponownie |
 | Aplikacja nie zapisuje raportu | brak praw do folderu | `icacls` wg punktu 3.3 |
 | Interfejs nie startuje (wariant z Pythonem) | brak tcl/tk | doinstaluj Pythona z komponentem tcl/tk |
+| EXE nie startuje albo zgłasza brak Tcl/Tk | skopiowano samo EXE bez `_internal\` | skopiuj cały folder wydania |
+| Po aktualizacji aplikacja zachowuje się dziwnie | podmieniono EXE bez `_internal\` | podmień obie rzeczy z jednego buildu |
+| Build zatrzymuje się na sumach SHA-256 | źródła zmienione po zatwierdzeniu | sprawdź zmiany i uruchom `approve_sources.bat` |
 | Testery rozłączają się w trakcie testu | pasywny hub USB | wepnij bezpośrednio albo użyj huba z zasilaczem |
 | Aplikacja odrzuca konfigurację przy zapisie | za wolna konsola na tym komputerze | sprawdź `check_dual.py`, podnieś `command_overhead_seconds` i zweryfikuj liczbę próbek |

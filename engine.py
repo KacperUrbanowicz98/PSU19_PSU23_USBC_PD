@@ -175,6 +175,19 @@ class TestEngine:
             final_message = str(exc)
             self._append_skipped(results, len(results), ProfileStatus.MEASUREMENT_ERROR, str(exc))
         finally:
+            # Utrata testera w trakcie testu daje objawy (brak próbek, nieudany reset),
+            # które same w sobie nie wskazują przyczyny. Nazywamy ją wprost.
+            if not self.hardware.connected:
+                final_message = _join_messages(
+                    final_message,
+                    "Tester przestał odpowiadać w trakcie testu"
+                    + (
+                        f" ({self.hardware.last_error})."
+                        if getattr(self.hardware, "last_error", "") else "."
+                    ),
+                )
+                if forced_status is None:
+                    forced_status = FinalStatus.ERROR
             if not self.hardware.safe_reset():
                 logger.error("Nie udało się przywrócić bezpiecznego stanu 5 V / 0 mA")
                 final_message = _join_messages(final_message, "Nie udało się przywrócić 5 V / 0 mA.")

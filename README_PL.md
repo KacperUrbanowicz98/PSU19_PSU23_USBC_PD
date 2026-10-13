@@ -1,4 +1,4 @@
-# PSU19 Tester v5.2 — test zasilaczy USB-C PD na PM125
+# PSU19 Tester v5.5 — test zasilaczy USB-C PD na PM125
 
 Aplikacja stanowiskowa do testu zasilaczy USB Power Delivery (SR213 PSU / SPBV36UK-W / SPBV36EU-W)
 przy użyciu testera PassMark PM125 i konsoli `USBPDConsole.exe`.
@@ -23,10 +23,11 @@ ui.py                 okno główne: operator, kanały, statystyki
 station_panel.py      panel jednego kanału pomiarowego
 detection.py          dopasowanie wykrytych testerów do gniazd
 settings_ui.py        panel inżynieryjny
-selftest.py           testy automatyczne (74 testy, w tym testy okien)
-build_exe.py          budowanie EXE
+selftest.py           testy automatyczne (83 testy, w tym testy okien)
+build_exe.py          budowanie wydania EXE (onedir) z kontrolami przed wydaniem
 test_config.json      konfiguracja stanowiska
-run_app.bat / run_simulator.bat / run_tests.bat / build_exe.bat
+approved_sources.json sumy SHA-256 zatwierdzonych źródeł (kontrola przy budowaniu)
+run_app.bat / run_simulator.bat / run_tests.bat / build_exe.bat / approve_sources.bat
 ```
 
 Dodatkowo `check_dual.py` — diagnostyka konsoli i testerów, uruchamiana ręcznie.
@@ -63,14 +64,32 @@ py -m unittest selftest -v
 
 albo `run_tests.bat`. 59 testów pokrywa m.in. wszystkie błędy naprawione w tej wersji.
 
-### Budowanie EXE
+### Budowanie wydania
 
 ```powershell
+approve_sources.bat      REM po sprawdzeniu zmian — zatwierdza sumy SHA-256 źródeł
 build_exe.bat
 ```
 
-Build najpierw uruchamia testy automatyczne i przerywa się, jeśli któryś nie przejdzie.
-W `dist` powstaje `PSU19_Tester.exe` i `test_config.json` — oba pliki kopiuje się na stanowisko.
+Powstaje folder `dist\PSU19 Tester\` (tryb **onedir**) — na stanowisko kopiuje się **cały
+folder**, nie samo EXE: biblioteki i runtime Tcl/Tk leżą w `_internal\`. Obok EXE lądują
+`test_config.json`, dokumentacja i `build_manifest.txt` z sumami SHA-256 wydania.
+
+Builder zatrzymuje się przed zbudowaniem czegokolwiek, gdy: środowisko się nie zgadza
+(Windows, Python 3.10+, PyInstaller 6.x, tkinter), nie przechodzą testy automatyczne,
+domyślna konfiguracja nie przechodzi walidacji, hasło inżynieryjne nie działa albo puste
+przechodzi, progi profili rozjechały się ze specyfikacją wyrobu, fazy są krótsze niż
+2,5 s + 2,5 s, sumy źródeł nie zgadzają się z `approved_sources.json`, albo z kodu
+zniknęła któraś z bramek (pierwszeństwo błędu stanowiska nad FAIL, odzyskiwanie testera,
+licznik prób, hasło panelu).
+
+To kontrola pomyłek, nie zabezpieczenie przed świadomą zmianą kodu: podmiana treści
+funkcji przy zachowanej nazwie przejdzie. `approved_sources.json` leży obok źródeł i nie
+jest podpisany — nie opisuj go w dokumentacji jakościowej jako kontroli bezpieczeństwa.
+
+Numer wersji ma **jedno źródło**: `APP_VERSION` w `config.py`. Builder i nagłówek raportu
+walidacyjnego czytają stamtąd, więc wersja w raporcie ze stanowiska nie może rozjechać się
+z wersją binarki.
 
 ## Stanowiska (jeden lub dwa testery)
 
@@ -317,6 +336,9 @@ z obu gniazd nie mieszają się ze sobą.
 
 Pozostałe zasady:
 
+- utrata testera w trakcie serii nie kasuje reszty cykli: przed każdym cyklem aplikacja
+  próbuje odzyskać połączenie (3 próby co 2 s), a odzyskanie jest wpisane do raportu;
+  gdy tester nie wraca, seria kończy się jawnym przerwaniem z podaniem powodu,
 - seria **nie zapisuje się do raportu produkcyjnego** — dane idą do `validation/`,
 - seria **nie zużywa licznika prób** żadnego numeru seryjnego,
 - serię można zatrzymać w dowolnym momencie; statystyka liczy się z wykonanych cykli,
@@ -329,7 +351,9 @@ Powstają dwa pliki na serię:
 - `validation/loop_<stanowisko>-<próbka>_<data>_raport.txt` — podsumowanie, to samo co widać
   w oknie.
 
-Raport zawiera: liczbę PASS/FAIL/ERROR i yield, ocenę powtarzalności, dla każdego profilu
+Raport zawiera: liczbę PASS/FAIL/ERROR i yield, ocenę powtarzalności, **rezystancję toru**
+(zasilacz + kabel + styk + wejście testera, liczoną ze spadku napięcia i zmierzonego prądu),
+dla każdego profilu
 i fazy min/max/średnią/σ napięcia oraz **zapas do bliższej granicy** w mV i w % szerokości
 okna kryterium, trend napięcia między cyklami (dryf w mV/cykl), statystykę prądu pod
 obciążeniem, listę zdarzeń oraz jednozdaniowy wniosek.
@@ -354,10 +378,23 @@ Czas: seria 20 cykli po ~30 s to ~11 minut z przerwami 2 s. Okno pokazuje szacun
 startem i czas pozostały w trakcie. Dwa gniazda walidowane równolegle to nadal ~11 minut,
 nie 22.
 
-Każde gniazdo waliduj **osobnym egzemplarzem** i porównaj raporty: różnica w zapasie do
-granicy między LEWYM a PRAWYM oznacza, że gniazda nie są równoważne (inna konfiguracja
-testera, inny kabel, inny styk) — wtedy ta sama sztuka może dostać różny wynik zależnie
-od tego, gdzie trafi.
+### Porównywanie gniazd
+
+Najpewniejszy test równoważności gniazd to **ten sam egzemplarz kolejno w obu** (nie dwa
+różne naraz — wtedy nie wiadomo, czy różnicę robi gniazdo, czy sztuka).
+
+Przy porównywaniu patrz na **rezystancję toru**, nie na samo napięcie pod obciążeniem.
+Spadek napięcia zależy od prądu profilu, rezystancja nie, więc to ona jest wspólną miarą:
+
+| Objaw | Co to znaczy |
+|---|---|
+| Napięcia **bez obciążenia** zgodne, **pod obciążeniem** rozjechane | różnica jest w torze, nie w wyrobie |
+| R jednego gniazda wyraźnie wyższa | gorszy kabel USB-C, zużyte gniazdo, słaby styk |
+| R rośnie w trakcie serii (dryf napięcia w dół) | styk grzeje się pod obciążeniem — pogarsza się z czasem pracy |
+| R zgodna, a mimo to inny wynik | różnica w konfiguracji testerów (`-r`) albo w samym wyrobie |
+
+Przy 3 A każde 100 mΩ nadmiarowej rezystancji to 300 mV mniej na wyjściu — przy progu
+4,75 V dla profilu 5 V to różnica między PASS a FAIL.
 
 ## Panel inżynieryjny
 

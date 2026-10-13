@@ -20,6 +20,8 @@ from detection import plan_station_remap
 from engine import TestEngine
 from hardware import PM125Client, SimulatedPM125
 from models import (
+    PHASE_NO_LOAD,
+    PHASE_LOAD,
     FinalStatus,
     Measurement,
     ProfileResult,
@@ -48,6 +50,8 @@ class FakeHardware:
         offset: float = 0.0,
     ) -> None:
         self.connected = True
+        #: Czy atrapa pozwala odzyskać połączenie (test serii po utracie testera).
+        self.allow_connect = True
         self.last_error = ""
         self.voltage = voltage
         #: Gdy True, atrapa zwraca napięcie nominalne ustawionego profilu (+ offset).
@@ -66,6 +70,10 @@ class FakeHardware:
         self.command_seconds = 0.0
 
     def connect(self) -> bool:
+        if not self.allow_connect:
+            self.last_error = "nie wykryto urządzenia"
+            return False
+        self.connected = True
         return True
 
     def disconnect(self) -> None:
@@ -596,6 +604,111 @@ class LoopValidationTests(unittest.TestCase):
         self.assertFalse((self.root / "serial_attempts.json").exists())
         self.assertFalse((self.root / "reports").exists())
 
+    def test_series_recovers_lost_tester(self) -> None:
+        """Regresja: utrata testera kasowała resztę serii fałszywymi błędami.
+
+        Raport ze stanowiska PRAWY: po utracie urządzenia w cyklu 12 osiem kolejnych
+        cykli kończyło się natychmiast komunikatem „PM125 nie jest połączony”.
+        """
+        hardware = FakeHardware(follow_profile=True)
+        engine = TestEngine(self.config, hardware)
+        runner = LoopRunner(self.config, engine)
+        runner.RECONNECT_PAUSE_SECONDS = 0.0
+        original_run = engine.run
+        state = {"cycle": 0}
+
+        def run_with_drop(*args, **kwargs):
+            state["cycle"] += 1
+            if state["cycle"] == 2:
+                hardware.connected = False
+                raise ConnectionError("tester zniknął")
+            return original_run(*args, **kwargs)
+
+        engine.run = run_with_drop
+        summary, _ = runner.run(label="WAL", hrid="TEST", cycles=4, pause_seconds=0.0)
+        self.assertEqual(summary.cycles_done, 4)
+        self.assertEqual(summary.reconnects, 1)
+        self.assertEqual(summary.passed, 3)
+        self.assertEqual(summary.errors, 1)
+        self.assertEqual(summary.aborted_reason, "")
+        self.assertTrue(hardware.connected)
+
+    def test_series_stops_when_tester_does_not_come_back(self) -> None:
+        """Gdy tester nie wraca, seria kończy się jawnym przerwaniem, nie serią ERROR-ów."""
+        hardware = FakeHardware(follow_profile=True)
+        hardware.connected = False
+        hardware.allow_connect = False
+        engine = TestEngine(self.config, hardware)
+        runner = LoopRunner(self.config, engine)
+        runner.RECONNECT_PAUSE_SECONDS = 0.0
+        summary, _ = runner.run(label="WAL", hrid="TEST", cycles=10, pause_seconds=0.0)
+        self.assertEqual(summary.cycles_done, 0)
+        self.assertTrue(summary.aborted_reason)
+        self.assertEqual(summary.errors, 0)
+        self.assertTrue(any("PRZERWANO" in item for item in summary.problems))
+
+    def test_verdict_reports_margin_even_with_station_errors(self) -> None:
+        """Problem z łącznością nie może przykryć informacji o przekroczonym kryterium."""
+        from loop_test import LoopSummary, PhaseStatistics, verdict_lines
+
+        summary = LoopSummary(
+            label="WAL", hrid="TEST", started="", finished="",
+            cycles_planned=20, cycles_done=20, passed=7, failed=3, errors=10,
+        )
+        summary.phases = [
+            PhaseStatistics(
+                profile="5V", phase=PHASE_LOAD, samples=60, minimum=4.742, maximum=4.803,
+                average=4.778, deviation=0.0193, limit_low=4.75, limit_high=5.50,
+                margin_low=-0.008, margin_high=0.697,
+            )
+        ]
+        lines = verdict_lines(summary)
+        self.assertTrue(any("NIEGOTOWE" in item for item in lines), lines)
+        self.assertTrue(any("PRZEKROCZONE" in item for item in lines), lines)
+
+    def test_source_resistance_separates_station_from_product(self) -> None:
+        """Liczby ze stanowisk LEWY/PRAWY: ten sam rozrzut napięcia, inna rezystancja toru."""
+        from loop_test import LoopSummary, PhaseStatistics
+
+        def summary_for(no_load: float, loaded: float, current: float) -> LoopSummary:
+            item = LoopSummary(
+                label="WAL", hrid="TEST", started="", finished="",
+                cycles_planned=20, cycles_done=20, passed=20,
+            )
+            item.phases = [
+                PhaseStatistics(profile="5V", phase=PHASE_NO_LOAD, average=no_load,
+                                limit_low=4.75, limit_high=5.50),
+                PhaseStatistics(profile="5V", phase=PHASE_LOAD, average=loaded,
+                                limit_low=4.75, limit_high=5.50),
+            ]
+            item.current_stats = [
+                PhaseStatistics(profile="5V", phase=PHASE_LOAD, average=current)
+            ]
+            return item
+
+        left = summary_for(5.148, 5.042, 3.0)
+        right = summary_for(5.151, 4.751, 3.0)
+        self.assertAlmostEqual(left.average_milliohms, 35.3, places=0)
+        self.assertAlmostEqual(right.average_milliohms, 133.3, places=0)
+        # Napięcie bez obciążenia prawie identyczne — różni je wyłącznie tor pod obciążeniem.
+        self.assertLess(abs(5.151 - 5.148), 0.005)
+        self.assertGreater(right.average_milliohms - left.average_milliohms, 90)
+
+    def test_source_resistance_needs_current(self) -> None:
+        """Bez zmierzonego prądu rezystancji nie da się policzyć — i nie jest zmyślana."""
+        from loop_test import LoopSummary, PhaseStatistics
+
+        summary = LoopSummary(
+            label="WAL", hrid="TEST", started="", finished="",
+            cycles_planned=1, cycles_done=1, passed=1,
+        )
+        summary.phases = [
+            PhaseStatistics(profile="5V", phase=PHASE_NO_LOAD, average=5.1),
+            PhaseStatistics(profile="5V", phase=PHASE_LOAD, average=5.0),
+        ]
+        self.assertEqual(summary.source_resistances, [])
+        self.assertEqual(summary.average_milliohms, 0.0)
+
     def test_margin_and_statistics(self) -> None:
         """Zapas do granic liczony jest z najgorszego pomiaru serii."""
         # +0,4 V do nominału: 9 V wychodzi 9,40 przy granicy 9,45 — zapas 50 mV.
@@ -854,6 +967,49 @@ class ReturnCodeTests(unittest.TestCase):
             runner.return_value.stdout = "0=PMPD80LLAD\n1=PMPD80LN6E\n"
             devices = find_devices("dowolny.exe")
         self.assertEqual(devices, [(0, "PMPD80LLAD"), (1, "PMPD80LN6E")])
+
+
+class ReleaseTests(unittest.TestCase):
+    """Wersja i hasło — rzeczy, które cicho rozjeżdżają się między wydaniami."""
+
+    def test_version_has_one_source(self) -> None:
+        """Regresja: raport ze stanowiska pokazywał 5.0.0, gdy build był 5.4.0."""
+        from config import APP_VERSION
+        import loop_test
+
+        self.assertIs(loop_test.APP_VERSION, APP_VERSION)
+        parts = APP_VERSION.split(".")
+        self.assertEqual(len(parts), 3, APP_VERSION)
+        self.assertTrue(all(item.isdigit() for item in parts), APP_VERSION)
+
+    def test_report_header_carries_running_version(self) -> None:
+        from config import APP_VERSION
+        from loop_test import LoopSummary, build_report_lines
+
+        summary = LoopSummary(
+            label="WAL", hrid="TEST", started="", finished="",
+            cycles_planned=1, cycles_done=1, passed=1,
+        )
+        self.assertIn(APP_VERSION, "\n".join(build_report_lines(summary)))
+
+    def test_engineering_password_unchanged(self) -> None:
+        """Hasło ma zostać dokładnie takie samo — trzymamy w źródle tylko jego skrót."""
+        config = AppConfig()
+        self.assertTrue(config.verify_engineering_password("recon" + "ext2025"))
+        self.assertFalse(config.verify_engineering_password("zle-haslo"))
+        self.assertFalse(config.verify_engineering_password(""))
+
+    def test_plaintext_password_is_not_in_sources(self) -> None:
+        """Build jest niepodpisany — jawne hasło dałoby się wyciągnąć z EXE."""
+        marker = "recon" + "ext2025"
+        folder = Path(__file__).resolve().parent
+        offenders = [
+            path.name
+            for path in sorted(folder.glob("*.py"))
+            if path.name not in {"selftest.py", "build_exe.py"}
+            and marker in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(offenders, [])
 
 
 def _tk_available() -> bool:

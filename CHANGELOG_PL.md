@@ -1,5 +1,125 @@
 # Zmiany
 
+## v5.5.0 — builder wydania w standardzie stanowiskowym
+
+Builder przerobiony na ten sam wzorzec co `create_exe.py` z Hi-Pota.
+
+### Tryb ONEDIR zamiast jednego pliku
+
+- Wydanie to **folder** `dist\PSU19 Tester\`, a nie pojedynczy EXE. Na stanowisko
+  kopiuje się cały folder — biblioteki i runtime Tcl/Tk leżą w `_internal\`.
+- `test_config.json` zostaje OBOK EXE i jest edytowalny z panelu inżynieryjnego.
+  Razem z nim kopiowana jest dokumentacja (README, INSTALACJA, CHANGELOG).
+- Hook startowy ustawia katalog roboczy na folder EXE, więc foldery danych powstają we
+  właściwym miejscu nawet przy źle ustawionym skrócie.
+- `build_manifest.txt` obok EXE: wersja, czas budowania, informacja o braku podpisu
+  cyfrowego i sumy SHA-256 wszystkich plików wydania.
+
+### Kontrole przed wydaniem
+
+- Środowisko: Windows, Python 3.10+, PyInstaller 6.x, obecność tkinter.
+- Kompilacja wszystkich źródeł i pełne testy automatyczne.
+- Kontrola ZACHOWANIA aplikacji, nie obecności napisów: domyślna konfiguracja przechodzi
+  walidację, hasło inżynieryjne działa, a błędne i puste odpada, progi profili zgadzają
+  się ze specyfikacją SR213 PSU, fazy 2,5 s + 2,5 s mieszczą się w timeoucie, a w fazie
+  zmieści się wymagana liczba ocenianych próbek.
+- Markery w źródłach — bramki, których wycięcie przeszłoby niezauważone, bo aplikacja
+  nadal by się uruchomiła: pierwszeństwo błędu stanowiska nad FAIL wyrobu, odzyskiwanie
+  utraconego testera, nieużywanie licznika prób przy błędzie stanowiska, hasło panelu,
+  rolowanie raportu przy zmianie zestawu profili.
+- `approved_sources.json` i `approve_sources.bat` — sumy SHA-256 źródeł. Rozbieżność
+  zatrzymuje build, czyli wykrywa zbudowanie wydania ze starej albo roboczej kopii pliku.
+- Builder używa wyłącznie plików o kanonicznych nazwach — `ui(3).py` nie zostanie wzięty
+  po cichu zamiast `ui.py`.
+
+Zakres tych kontroli jest opisany wprost w nagłówku `build_exe.py`: łapią pomyłki, nie
+świadomą zmianę kodu. Podmiana treści funkcji przy zachowanej nazwie przejdzie, a lista
+sum leży obok źródeł i nie jest podpisana.
+
+### Wersja miała dwa źródła i już się rozjechała
+
+Raporty ze stanowiska drukowały „PSU19 Tester 5.0.0", podczas gdy builder miał 5.4.0:
+`APP_VERSION` siedziało w `loop_test.py` i nikt go nie podnosił.
+
+- `APP_VERSION` przeniesione do `config.py` jako **jedyne źródło wersji**. Builder czyta
+  je stamtąd, nagłówek raportu też.
+- Dwa testy pilnują, że obie drogi pokazują tę samą wartość.
+
+### Hasło inżynieryjne — bez zmian, ale nie w binarce
+
+Hasło pozostaje dokładnie to samo i nadal jest statyczne. Zmieniło się tylko to, że
+w źródle jest gotowy skrót SHA-256 zamiast `password_hash("...")` — build nie jest
+podpisany, więc jawny literal dałoby się wyciągnąć z EXE poleceniem `strings`.
+Builder odrzuca wydanie, jeśli jawne hasło wróci do kodu (kontrola składa też literały
+sklejane z kawałków). Test pilnuje, że hasło działa tak samo jak wcześniej.
+
+Razem 83 testy.
+
+## v5.4.0 — rezystancja toru w raporcie walidacyjnym
+
+Porównanie serii z obu gniazd (LEWY 20/20 PASS, PRAWY 13 FAIL) wymagało ręcznego
+rachunku, żeby pokazać, że różnica siedzi w torze, a nie w wyrobie. Ten rachunek jest
+teraz w raporcie.
+
+- Nowa sekcja **REZYSTANCJA TORU** — dla każdego profilu: napięcie bez obciążenia,
+  pod obciążeniem, spadek w mV, zmierzony prąd i wyliczona rezystancja w mΩ, plus
+  średnia z profili.
+- Liczona z danych, które seria i tak zbiera — bez dodatkowych komend i bez wydłużania
+  cyklu.
+- Po co: spadek napięcia zależy od prądu profilu, więc nie da się nim porównywać
+  profili ani gniazd. Rezystancja nie zależy — i to ona od razu pokazuje gorszy kabel,
+  zużyte gniazdo albo słaby styk.
+- Dla danych ze stanowiska: LEWY 45 mΩ, PRAWY 145 mΩ. Sto miliomów różnicy to przy 3 A
+  równo 300 mV mniej na wyjściu — dokładnie tyle, ile dzieliło oba gniazda.
+
+Razem 79 testów.
+
+## v5.3.0 — odzyskiwanie testera i czytelniejszy werdykt walidacji
+
+Wnioski z serii walidacyjnej na stanowisku PRAWYM (20 cykli, PASS 7 / FAIL 3 / ERROR 10).
+
+### Utrata testera kasowała resztę serii
+
+Po utracie urządzenia w cyklu 12 osiem kolejnych cykli kończyło się natychmiast
+komunikatem „PM125 nie jest połączony”. Nic nigdy nie próbowało odzyskać połączenia,
+więc raport pokazał 10 błędów stanowiska zamiast jednego zdarzenia, a 8 z 20 cykli
+przepadło.
+
+- `LoopRunner` przed każdym cyklem sprawdza połączenie i próbuje je odzyskać —
+  3 próby co 2 s. Odzyskanie trafia do raportu jako osobna pozycja.
+- Gdy tester nie wraca, seria kończy się **jawnym przerwaniem z powodem**, zamiast
+  mielić pozostałe cykle na fałszywe ERROR-y. Raport mówi wprost, że statystyka jest
+  niepełna i z ilu cykli policzona.
+- Dwa testy regresyjne odtwarzają dokładnie ten przebieg.
+
+### To samo w produkcji
+
+Kontrola obecności testera działała **tylko gdy tester był połączony** — po utracie USB
+gniazdo zostawało w stanie BRAK TESTERA aż do ręcznego kliknięcia „Połącz ponownie”.
+
+- Kontrola obecności próbuje teraz odzyskać utracony tester automatycznie (co cykl
+  kontroli, czyli domyślnie co 20 s), gdy gniazdo jest wolne.
+- Powtarzalny błąd połączenia logowany jest raz, odzyskanie zawsze — bez zalewania logu.
+
+### Diagnostyka przyczyny
+
+Cykl 12 raportował objaw („za mało ocenianych pomiarów, z obciążeniem 0”), nie przyczynę.
+
+- Gdy tester znika w trakcie testu, wynik mówi to wprost: „Tester przestał odpowiadać
+  w trakcie testu” razem z komunikatem z konsoli.
+
+### Werdykt nie przykrywa już drugiego problemu
+
+Poprzednio werdykt zwracał **jedno** zdanie, więc błędy stanowiska przykryły to, co
+w tej serii było najważniejsze: 5 V z obciążeniem zeszło 8 mV **poniżej** granicy 4,75 V.
+
+- Werdykt zwraca teraz osobne zdanie na każdy niezależny wniosek: błędy stanowiska,
+  problem łączności, przekroczone kryterium, ciasny margines.
+- Ujemny zapas (kryterium faktycznie przekroczone w serii) ma własny, mocniejszy opis —
+  wcześniej wpadał do tej samej kategorii co „margines poniżej 5 %”.
+
+Razem 77 testów.
+
 ## v5.2.0 — naprawa trybu walidacyjnego i serie na wszystkich testerach
 
 ### Błąd: okno serii w ogóle się nie otwierało
